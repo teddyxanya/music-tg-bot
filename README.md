@@ -39,30 +39,30 @@
 
 ```mermaid
 flowchart TD
-    User([Пользователь в Telegram / iOS Shortcut]) --> Ingress{Входной запрос}
+    User(["Пользователь в Telegram / iOS Shortcut"]) --> Ingress{"Входной запрос"}
     
     subgraph Service["music-tg-bot (Systemd / Port 8082)"]
-        Ingress -->|Сообщение / Команда| TG[Telegram Bot Controller]
-        Ingress -->|HTTP Webhook /shazam| WH[Threaded Webhook Server]
+        Ingress -->|Сообщение / Команда| TG["Telegram Bot Controller"]
+        Ingress -->|HTTP Webhook /shazam| WH["Threaded Webhook Server"]
         
-        TG -->|Submit Task| Pool[ThreadPoolExecutor Worker Pool]
+        TG -->|Submit Task| Pool["ThreadPoolExecutor Worker Pool"]
         WH -->|Submit Task| Pool
         
-        Pool --> DL[Music Downloader]
-        DL -->|1. Попытка YouTube (Android/iOS)| YT[(YouTube Engine)]
-        DL -->|2. Фоллбэк при ошибке| SC[(SoundCloud Engine)]
+        Pool --> DL["Music Downloader"]
+        DL -->|1. Попытка YouTube (Android/iOS)| YT[("YouTube Engine")]
+        DL -->|2. Фоллбэк при ошибке| SC[("SoundCloud Engine")]
         
-        DL --> FF[FFmpeg 320k + Mutagen ID3]
-        FF --> Preview[Отправка MP3 Preview в ЛС]
+        DL --> FF["FFmpeg 320k + Mutagen ID3"]
+        FF --> Preview["Отправка MP3 Preview в ЛС"]
         
-        Preview --> Action{Действие пользователя}
-        Action -->|✅ Закинуть| Pub[Публикация в Music Channel #музыка]
-        Action -->|❌ Отмена| Del[Удаление файла и сообщения]
+        Preview --> Action{"Действие пользователя"}
+        Action -->|✅ Закинуть| Pub["Публикация в Music Channel (#музыка)"]
+        Action -->|❌ Отмена| Del["Удаление файла и сообщения"]
     end
     
-    subgraph Storage[Диск]
-        FF -.-> Temp[(Временные файлы downloads/)]
-        Del -.-> Clean[Очистка папки]
+    subgraph Storage["Диск"]
+        FF -.-> Temp[("Временные файлы downloads/")]
+        Del -.-> Clean["Очистка папки"]
         Pub -.-> Clean
     end
 ```
