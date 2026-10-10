@@ -65,15 +65,13 @@ def clean_metadata(
     Removes YouTube video junk like (Official Video), [Audio], etc.
     Avoids duplicate artist occurrences (e.g. 'Moby - Moby - Natural Blues').
     """
+    artist = (hint_artist or raw_artist or "").strip()
+    title = (hint_title or raw_title or "").strip()
+
     if hint_artist and hint_title:
-        artist = hint_artist.strip()
-        title = hint_title.strip()
         # If title starts with artist, strip it
         title = re.sub(rf"^{re.escape(artist)}\s*[-–—:]\s*", "", title, flags=re.IGNORECASE).strip()
     else:
-        artist = raw_artist.strip() if raw_artist else ""
-        title = raw_title.strip() if raw_title else ""
-
         # Remove video junk recursively until clean
         prev_title = None
         while prev_title != title:

@@ -68,6 +68,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 q = clean_art
             elif clean_tit and clean_tit != "Без названия":
                 q = clean_tit
+            elif artist or title:
+                q = f"{artist} {title}".strip()
 
         return q, clean_art if clean_art != "Неизвестен" else artist, clean_tit if clean_tit != "Без названия" else title
 
@@ -177,6 +179,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     q = clean_art
                 elif clean_tit and clean_tit != "Без названия":
                     q = clean_tit
+                elif artist or title:
+                    q = f"{artist} {title}".strip()
 
             if not q:
                 self._send_json(400, {"ok": False, "error": "Missing query or artist/title"})
