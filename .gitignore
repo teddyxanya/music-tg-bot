@@ -53,6 +53,12 @@ htmlcov/
 *.log
 logs/
 
+# SQLite & Data storage
+data/
+*.db
+*.sqlite
+*.sqlite3
+
 # IDE & OS files
 .vscode/
 .idea/
