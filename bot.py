@@ -121,6 +121,24 @@ class MusicBot:
             return True
         return str(sender_id) == str(self.settings.owner_id)
 
+    def forward_to_sub_server(self, cmd: str, args: List[str], sender_id: str = "", chat_id: str = "") -> Optional[dict]:
+        """Forwards proxy/subscription commands to the local e0f sub server daemon."""
+        try:
+            url = f"{self.settings.sub_server_url.rstrip('/')}/api/tg_command"
+            payload = {
+                "cmd": cmd,
+                "args": args,
+                "sender_user_id": sender_id,
+                "chat_id": chat_id
+            }
+            resp = requests.post(url, json=payload, timeout=25)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.error(f"Sub-server returned HTTP {resp.status_code}: {resp.text}")
+        except Exception as e:
+            logger.warning(f"Could not connect to sub-server ({self.settings.sub_server_url}): {e}")
+        return None
+
     def process_search_and_preview(
         self,
         query: str,
@@ -728,23 +746,49 @@ class MusicBot:
 
         if cmd in ("/start", "/help"):
             help_text = (
-                "🎵 <b>Telegram Music Bot & Downloader 2.0</b>\n\n"
-                "Отправьте боту название трека или вставьте ссылку на песню / альбом.\n\n"
-                "<b>Возможности:</b>\n"
-                "• ⚡ <b>Мгновенная отправка из кэша (0.1 сек)</b> для ранее загруженных песен\n"
-                "• 🖼 <b>100% обложки</b>: квадратный кроп 1:1, поддержка WebP, embedding в MP3 и предпросмотр\n"
-                "• 🔊 <b>Нормализация громкости (EBU R128)</b>: единая комфортная громкость без перепадов\n"
-                "• 🔀 <b>Другие версии</b>: выбор между оригиналом, ремиксом или live-версией\n"
-                "• 📝 <b>Текст песни</b>: вывод слов трека прямо в чат\n"
-                "• 🏷 <b>Авто-жанр</b>: добавление хэштегов жанра (#hiphop, #rock, #electronic)\n"
-                "• ✏️ <b>Изменение тегов</b>: редактирование Артиста и Названия на лету\n"
-                "• 🔗 <b>Прямые ссылки</b>: YouTube, SoundCloud, Spotify, Apple Music, Яндекс Музыка\n"
-                "• 📂 <b>Альбомы и плейлисты</b>: <code>/album &lt;ссылка&gt;</code> для пакетного скачивания"
+                "🤖 <b>Единый бот: Прокси-чекер & Музыка</b>\n\n"
+                "🌐 <b>Управление прокси и подписками (Gemini):</b>\n"
+                "• 📊 <code>/status</code> — Общий статус серверов, кэша и Gemini\n"
+                "• 📋 <code>/profiles</code> — Список всех профилей и подписок Shadowrocket\n"
+                "• ➕ <code>/newprofile &lt;имя&gt;</code> — Создать профиль и выделить AWG-серверы\n"
+                "• ➖ <code>/delprofile &lt;имя&gt;</code> — Удалить профиль и освободить слоты\n"
+                "• 🔄 <code>/sync</code> — Принудительная синхронизация с e0f.cx\n"
+                "• 🔎 <code>/check</code> — Запуск теста Gemini серверов (Web + API)\n\n"
+                "🎵 <b>Музыкальный плеер и загрузчик:</b>\n"
+                "• Отправьте название трека или ссылку (YouTube, SoundCloud, Spotify, Apple, Яндекс)\n"
+                "• <code>/music &lt;название&gt;</code> — Скачать MP3 (320 kbps, обложка 1:1, EBU R128)\n"
+                "• <code>/album &lt;ссылка&gt;</code> — Пакетное скачивание плейлиста или альбома\n"
+                "• <code>/lyrics &lt;трек&gt;</code> — Поиск и показ слов песни\n"
+                "• <code>/mstatus</code> — Детальный статус только музыкального модуля"
             )
             self.send_message(chat_id, help_text)
             return
 
         if cmd == "/status":
+            num_workers = self.settings.max_workers
+            disk_items = len(list(self.settings.download_dir.glob("*")))
+            with self._lock:
+                active_count = len(self.active_track_actions)
+            cache_count = self.db.count_cached_tracks()
+
+            music_block = (
+                "🎵 <b>Статус Music Bot:</b>\n"
+                f"⚙️ Воркеров: <code>{num_workers}</code> (активных задач: <code>{active_count}</code>)\n"
+                f"⚡ Треков в кэше: <code>{cache_count}</code>\n"
+                f"📁 Временных файлов: <code>{disk_items}</code>\n"
+                f"📢 Канал: <code>{self.settings.channel_id or 'Не настроен'}</code>"
+            )
+
+            sub_res = self.forward_to_sub_server("/status", [], sender_id, chat_id)
+            if sub_res and sub_res.get("text"):
+                status_text = f"{sub_res['text']}\n\n━━━━━━━━━━━━━━━━━━━━\n{music_block}"
+            else:
+                status_text = f"📊 <b>Статус Gemini Checker</b>\n⚠️ Сервис недоступен (порт 8088)\n\n━━━━━━━━━━━━━━━━━━━━\n{music_block}"
+
+            self.send_message(chat_id, status_text)
+            return
+
+        if cmd == "/mstatus":
             num_workers = self.settings.max_workers
             disk_items = len(list(self.settings.download_dir.glob("*")))
             with self._lock:
@@ -760,6 +804,29 @@ class MusicBot:
                 f"🌐 Webhook порт: <code>{self.settings.port}</code>"
             )
             self.send_message(chat_id, status_text)
+            return
+
+        PROXY_COMMANDS = {
+            "/profiles", "/list",
+            "/newprofile", "/add", "/create",
+            "/delprofile", "/delete", "/del",
+            "/check", "/sync"
+        }
+        if cmd in PROXY_COMMANDS:
+            if cmd in ("/newprofile", "/add", "/create") and args:
+                self.send_message(chat_id, f"⏳ Создаю профиль <b>«{args[0]}»</b> и выделяю AWG-серверы...")
+            elif cmd == "/sync":
+                self.send_message(chat_id, "⏳ Синхронизация всех профилей...")
+
+            res = self.forward_to_sub_server(cmd, args, sender_id, chat_id)
+            if res and res.get("text"):
+                self.send_message(chat_id, res["text"])
+            else:
+                self.send_message(
+                    chat_id,
+                    "⚠️ <b>Сервис прокси-чекера недоступен</b> (порт 8088).\n"
+                    "Проверьте работу службы <code>e0f-sub.service</code> на сервере."
+                )
             return
 
         if cmd in ("/album", "/playlist"):

@@ -36,6 +36,7 @@ class Settings:
     max_workers: int
     temp_expiration_sec: int
     download_dir: Path
+    sub_server_url: str = "http://127.0.0.1:8088"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -45,6 +46,7 @@ class Settings:
         channel_id = os.getenv("MUSIC_CHANNEL_ID", "").strip() or None
         shazam_secret = os.getenv("SHAZAM_SECRET_TOKEN", "").strip()
         host = os.getenv("WEBHOOK_HOST", "127.0.0.1").strip()
+        sub_server_url = os.getenv("SUB_SERVER_URL", "http://127.0.0.1:8088").strip()
         
         try:
             port = int(os.getenv("WEBHOOK_PORT", "8082"))
@@ -73,7 +75,8 @@ class Settings:
             port=port,
             max_workers=max_workers,
             temp_expiration_sec=temp_expiration_sec,
-            download_dir=download_dir
+            download_dir=download_dir,
+            sub_server_url=sub_server_url
         )
 
 # Global settings instance

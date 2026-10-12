@@ -338,5 +338,112 @@ class TestConcurrencyAndNonBlocking(unittest.TestCase):
         handler.send_response.assert_called_with(200)
         real_executor.shutdown(wait=True)
 
+class TestProxyCommandRouting(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.settings = Settings(
+            bot_token="test_token",
+            chat_id="12345",
+            owner_id="12345",
+            channel_id="-10099999",
+            shazam_secret="secret",
+            host="127.0.0.1",
+            port=8082,
+            max_workers=2,
+            temp_expiration_sec=3600,
+            download_dir=Path(self.test_dir) / "downloads",
+            sub_server_url="http://127.0.0.1:8088"
+        )
+        self.settings.download_dir.mkdir(parents=True, exist_ok=True)
+        (Path(self.test_dir) / "data").mkdir(parents=True, exist_ok=True)
+        self.bot = MusicBot(self.settings)
+        self.bot.send_message = MagicMock()
+
+    def tearDown(self):
+        self.bot.executor.shutdown(wait=False)
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @patch("bot.requests.post")
+    def test_forward_to_sub_server_success(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"handled": True, "text": "✅ OK Profiles"}
+        mock_post.return_value = mock_resp
+
+        result = self.bot.forward_to_sub_server("/profiles", [], sender_id="12345", chat_id="12345")
+        self.assertEqual(result, {"handled": True, "text": "✅ OK Profiles"})
+        mock_post.assert_called_once_with(
+            "http://127.0.0.1:8088/api/tg_command",
+            json={"cmd": "/profiles", "args": [], "sender_user_id": "12345", "chat_id": "12345"},
+            timeout=25
+        )
+
+    @patch("bot.requests.post", side_effect=Exception("Connection refused"))
+    def test_forward_to_sub_server_error(self, mock_post):
+        result = self.bot.forward_to_sub_server("/profiles", [], sender_id="12345", chat_id="12345")
+        self.assertIsNone(result)
+
+    @patch("bot.MusicBot.forward_to_sub_server")
+    def test_handle_message_proxy_command_dispatched(self, mock_forward):
+        mock_forward.return_value = {"handled": True, "text": "📋 <b>Активные профили:</b> Xan, iya"}
+        msg = {
+            "chat": {"id": "12345"},
+            "from": {"id": "12345"},
+            "text": "/profiles"
+        }
+        self.bot.handle_message(msg)
+        mock_forward.assert_called_once_with("/profiles", [], "12345", "12345")
+        self.bot.send_message.assert_called_with("12345", "📋 <b>Активные профили:</b> Xan, iya")
+
+    @patch("bot.MusicBot.forward_to_sub_server", return_value=None)
+    def test_handle_message_proxy_command_offline(self, mock_forward):
+        msg = {
+            "chat": {"id": "12345"},
+            "from": {"id": "12345"},
+            "text": "/sync"
+        }
+        self.bot.handle_message(msg)
+        self.bot.send_message.assert_any_call("12345", "⏳ Синхронизация всех профилей...")
+        calls = [c[0][1] for c in self.bot.send_message.call_args_list]
+        self.assertTrue(any("Сервис прокси-чекера недоступен" in c for c in calls))
+
+    @patch("bot.MusicBot.forward_to_sub_server")
+    def test_handle_message_combined_status(self, mock_forward):
+        mock_forward.return_value = {"handled": True, "text": "📊 <b>Статус Gemini Checker</b>\n✅ 5 нод"}
+        msg = {
+            "chat": {"id": "12345"},
+            "from": {"id": "12345"},
+            "text": "/status"
+        }
+        self.bot.handle_message(msg)
+        mock_forward.assert_called_once_with("/status", [], "12345", "12345")
+        sent_text = self.bot.send_message.call_args[0][1]
+        self.assertIn("Статус Gemini Checker", sent_text)
+        self.assertIn("Статус Music Bot", sent_text)
+
+    def test_handle_message_mstatus(self):
+        msg = {
+            "chat": {"id": "12345"},
+            "from": {"id": "12345"},
+            "text": "/mstatus"
+        }
+        self.bot.handle_message(msg)
+        sent_text = self.bot.send_message.call_args[0][1]
+        self.assertIn("Статус Music Bot", sent_text)
+        self.assertNotIn("Gemini Checker", sent_text)
+
+    def test_handle_message_help_unified(self):
+        msg = {
+            "chat": {"id": "12345"},
+            "from": {"id": "12345"},
+            "text": "/help"
+        }
+        self.bot.handle_message(msg)
+        sent_text = self.bot.send_message.call_args[0][1]
+        self.assertIn("Единый бот: Прокси-чекер & Музыка", sent_text)
+        self.assertIn("/profiles", sent_text)
+        self.assertIn("/newprofile", sent_text)
+        self.assertIn("/music", sent_text)
+
 if __name__ == "__main__":
     unittest.main()
