@@ -74,6 +74,8 @@ flowchart TD
         Ingress -->|"Сообщение или команда"| TG["Telegram Bot Controller"]
         Ingress -->|"HTTP Webhook /shazam"| WH["Threaded Webhook Server"]
         
+        TG -->|"Команды прокси (/profiles, /sync, /check)"| ProxyRoute["POST http://127.0.0.1:8088/api/tg_command"]
+        
         TG -->|"1. Проверка SQLite кэша"| Cache[("SQLite bot.db file_id")]
         Cache -->|"Попадание в кэш (0.1с)"| InstantSend["Мгновенная отправка audio=file_id"]
         
@@ -98,6 +100,10 @@ flowchart TD
         Actions -->|"❌ Отмена"| Del["Удаление временного MP3"]
         
         Pub --> CacheSave["Сохранение file_id в кэш"]
+    end
+
+    subgraph ProxyService["Gemini-Proxy-Checker (e0f Daemon / Port 8088)"]
+        ProxyRoute --> Daemon["e0f_sub_server.py (Прокси, AWG, Gemini)"]
     end
 ```
 
