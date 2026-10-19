@@ -33,6 +33,12 @@ from downloader import (
 
 logger = logging.getLogger("music_bot.controller")
 
+_TOKEN_RE = re.compile(r'\d{8,11}:[A-Za-z0-9_-]{35}')
+
+def _mask_token(text: str) -> str:
+    """Replace any Telegram bot token in a string with '***' before logging."""
+    return _TOKEN_RE.sub('bot***REDACTED***', str(text))
+
 # Telegram limits
 MAX_TELEGRAM_AUDIO_BYTES = 49 * 1024 * 1024  # 49 MB
 TRACK_ID_REGEX = re.compile(r"^[a-f0-9]{8}$")
@@ -1022,7 +1028,7 @@ class MusicBot:
                         self.handle_message(msg)
 
             except Exception as e:
-                logger.error(f"Polling loop exception: {e}")
+                logger.error(f"Polling loop exception: {_mask_token(e)}")
                 time.sleep(3)
 
     def stop(self):
