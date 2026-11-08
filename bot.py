@@ -137,7 +137,7 @@ class MusicBot:
                 "sender_user_id": sender_id,
                 "chat_id": chat_id
             }
-            resp = requests.post(url, json=payload, timeout=25)
+            resp = requests.post(url, json=payload, timeout=90)
             if resp.status_code == 200:
                 return resp.json()
             logger.error(f"Sub-server returned HTTP {resp.status_code}: {resp.text}")

@@ -375,7 +375,7 @@ class TestProxyCommandRouting(unittest.TestCase):
         mock_post.assert_called_once_with(
             "http://127.0.0.1:8088/api/tg_command",
             json={"cmd": "/profiles", "args": [], "sender_user_id": "12345", "chat_id": "12345"},
-            timeout=25
+            timeout=90
         )
 
     @patch("bot.requests.post", side_effect=Exception("Connection refused"))
