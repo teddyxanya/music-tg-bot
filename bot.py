@@ -55,10 +55,18 @@ class MusicBot:
         # Concurrency safety: atomic active tasks set to prevent duplicate publishes / race conditions
         self._lock = threading.Lock()
         self.active_track_actions: Set[str] = set()
+        self.active_searches: Set[str] = set()
         self.user_states: Dict[str, Dict[str, Any]] = {}
 
         # Reusable requests session with connection pooling and retries
         self.session = requests.Session()
+        if self.settings.telegram_proxy:
+            self.session.proxies = {
+                "http": self.settings.telegram_proxy,
+                "https": self.settings.telegram_proxy
+            }
+            logger.info(f"Using Telegram API proxy: {self.settings.telegram_proxy}")
+
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         adapter = HTTPAdapter(
             pool_connections=settings.max_workers + 4,
@@ -108,7 +116,12 @@ class MusicBot:
             payload["reply_to_message_id"] = reply_to_message_id
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        return self._api_call("sendMessage", json_data=payload)
+        res = self._api_call("sendMessage", json_data=payload)
+        if not res.get("ok") and reply_to_message_id:
+            # Fallback if reply target message was deleted or not found
+            payload.pop("reply_to_message_id", None)
+            res = self._api_call("sendMessage", json_data=payload)
+        return res
 
     def delete_message(self, chat_id: str, message_id: int):
         self._api_call("deleteMessage", json_data={"chat_id": chat_id, "message_id": message_id}, timeout=5)
@@ -334,162 +347,194 @@ class MusicBot:
             return
 
         clean_query = query.strip()
+        norm_key = re.sub(r'[^a-zA-Z0-9а-яА-ЯёЁ]', '', clean_query.lower())
+        search_lock_key = f"{chat_id}:{norm_key}"
 
-        # Step 1: Check instant SQLite cache (file_id) for instant 0.1s replay
-        if not direct_url:
-            cached = self.db.get_cached_track(clean_query, hint_artist, hint_title)
-            if cached and cached.get("file_id"):
-                logger.info(f"Instant cache hit for '{clean_query}': file_id {cached['file_id']}")
-                m, s = divmod(cached["duration"], 60)
+        with self._lock:
+            if search_lock_key in self.active_searches:
+                logger.info(f"Deduplicating duplicate in-flight search '{clean_query}' for chat {chat_id}")
+                self.send_message(
+                    chat_id,
+                    f"⏳ <b>Трек уже скачивается:</b>\n<code>{clean_query}</code>\n<i>Пожалуйста, подождите пару секунд...</i>",
+                    reply_to_message_id=reply_to_msg_id
+                )
+                return
+            self.active_searches.add(search_lock_key)
+
+        stop_action = threading.Event()
+        def _keep_chat_action():
+            while not stop_action.is_set():
+                try:
+                    self._api_call("sendChatAction", json_data={"chat_id": str(chat_id), "action": "upload_voice"}, timeout=5)
+                except Exception:
+                    pass
+                stop_action.wait(4.0)
+
+        action_thread = threading.Thread(target=_keep_chat_action, daemon=True)
+        action_thread.start()
+
+        status_msg_id = None
+        try:
+            # Step 1: Check instant SQLite cache (file_id) for instant 0.1s replay
+            if not direct_url:
+                cached = self.db.get_cached_track(clean_query, hint_artist, hint_title)
+                if cached and cached.get("file_id"):
+                    logger.info(f"Instant cache hit for '{clean_query}': file_id {cached['file_id']}")
+                    m, s = divmod(cached["duration"], 60)
+                    dur_str = f"{m}:{s:02d}"
+                    _, ch_title = self.get_user_target_channel(chat_id)
+                    ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
+                    caption = (
+                        f"⚡ <b>Мгновенно из кэша (0.1 сек):</b>\n"
+                        f"🎵 <b>{cached['artist']} — {cached['title']}</b>\n"
+                        f"⏱ Длительность: <code>{dur_str}</code>\n"
+                        f"🏷 Жанр: {cached.get('genre') or '#музыка'}\n\n"
+                        f"Опубликовать {ch_prompt}?"
+                    )
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "✅ Закинуть в канал", "callback_data": f"pubcached:{cached['id']}"},
+                                {"text": "📝 Текст песни", "callback_data": f"clyr:{cached['id']}"}
+                            ]
+                        ]
+                    }
+                    send_res = self._api_call("sendAudio", json_data={
+                        "chat_id": str(chat_id),
+                        "audio": cached["file_id"],
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                        "reply_markup": reply_markup
+                    })
+                    if send_res.get("ok"):
+                        return
+                    logger.warning(f"Cached file_id expired/invalid for '{clean_query}'. Falling back to fresh download...")
+
+            # Step 2: Inform user about search & download
+            status_msg = self.send_message(
+                chat_id,
+                f"🔎 <b>Ищу и скачиваю трек:</b>\n<code>{clean_query}</code>...",
+                reply_to_message_id=reply_to_msg_id
+            )
+            status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg.get("ok") else None
+
+            try:
+                track = self.downloader.download_track(
+                    clean_query,
+                    hint_artist=hint_artist,
+                    hint_title=hint_title,
+                    direct_url=direct_url
+                )
+
+                # Check Telegram file size limit
+                file_size = track.mp3_path.stat().st_size
+                if file_size > MAX_TELEGRAM_AUDIO_BYTES:
+                    raise Exception(f"Файл трека слишком большой ({file_size // (1024*1024)} МБ). Лимит Telegram — 50 МБ.")
+
+                m, s = divmod(track.duration, 60)
                 dur_str = f"{m}:{s:02d}"
+
+                source_icon = "🎥 YouTube" if track.source == "youtube" else "☁️ SoundCloud"
                 _, ch_title = self.get_user_target_channel(chat_id)
                 ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
                 caption = (
-                    f"⚡ <b>Мгновенно из кэша (0.1 сек):</b>\n"
-                    f"🎵 <b>{cached['artist']} — {cached['title']}</b>\n"
+                    f"🎧 <b>Найден трек ({source_icon}):</b>\n"
+                    f"🎵 <b>{track.artist} — {track.title}</b>\n"
                     f"⏱ Длительность: <code>{dur_str}</code>\n"
-                    f"🏷 Жанр: {cached.get('genre') or '#музыка'}\n\n"
+                    f"🏷 Жанр: {track.genre}\n\n"
                     f"Опубликовать {ch_prompt}?"
                 )
+
                 reply_markup = {
                     "inline_keyboard": [
                         [
-                            {"text": "✅ Закинуть в канал", "callback_data": f"pubcached:{cached['id']}"},
-                            {"text": "📝 Текст песни", "callback_data": f"clyr:{cached['id']}"}
+                            {"text": "✅ Закинуть в канал", "callback_data": f"pub:{track.id}"},
+                            {"text": "❌ Отмена", "callback_data": f"del:{track.id}"}
+                        ],
+                        [
+                            {"text": "🔀 Другие версии", "callback_data": f"alt:{track.id}"},
+                            {"text": "📝 Текст песни", "callback_data": f"lyr:{track.id}"}
+                        ],
+                        [
+                            {"text": "✏️ Изменить теги", "callback_data": f"edit:{track.id}"}
                         ]
                     ]
                 }
-                send_res = self._api_call("sendAudio", json_data={
-                    "chat_id": str(chat_id),
-                    "audio": cached["file_id"],
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                    "reply_markup": reply_markup
-                })
-                if send_res.get("ok"):
-                    return
-                logger.warning(f"Cached file_id expired/invalid for '{clean_query}'. Falling back to fresh download...")
 
-        # Step 2: Inform user about search & download
-        status_msg = self.send_message(
-            chat_id,
-            f"🔎 <b>Ищу и скачиваю трек:</b>\n<code>{clean_query}</code>...",
-            reply_to_message_id=reply_to_msg_id
-        )
-        status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg.get("ok") else None
-
-        try:
-            track = self.downloader.download_track(
-                clean_query,
-                hint_artist=hint_artist,
-                hint_title=hint_title,
-                direct_url=direct_url
-            )
-
-            # Check Telegram file size limit
-            file_size = track.mp3_path.stat().st_size
-            if file_size > MAX_TELEGRAM_AUDIO_BYTES:
-                raise Exception(f"Файл трека слишком большой ({file_size // (1024*1024)} МБ). Лимит Telegram — 50 МБ.")
-
-            m, s = divmod(track.duration, 60)
-            dur_str = f"{m}:{s:02d}"
-
-            source_icon = "🎥 YouTube" if track.source == "youtube" else "☁️ SoundCloud"
-            _, ch_title = self.get_user_target_channel(chat_id)
-            ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
-            caption = (
-                f"🎧 <b>Найден трек ({source_icon}):</b>\n"
-                f"🎵 <b>{track.artist} — {track.title}</b>\n"
-                f"⏱ Длительность: <code>{dur_str}</code>\n"
-                f"🏷 Жанр: {track.genre}\n\n"
-                f"Опубликовать {ch_prompt}?"
-            )
-
-            reply_markup = {
-                "inline_keyboard": [
-                    [
-                        {"text": "✅ Закинуть в канал", "callback_data": f"pub:{track.id}"},
-                        {"text": "❌ Отмена", "callback_data": f"del:{track.id}"}
-                    ],
-                    [
-                        {"text": "🔀 Другие версии", "callback_data": f"alt:{track.id}"},
-                        {"text": "📝 Текст песни", "callback_data": f"lyr:{track.id}"}
-                    ],
-                    [
-                        {"text": "✏️ Изменить теги", "callback_data": f"edit:{track.id}"}
-                    ]
-                ]
-            }
-
-            # Metadata for callback button handling
-            track_meta = {
-                "id": track.id,
-                "title": track.title,
-                "artist": track.artist,
-                "duration": track.duration,
-                "mp3_path": str(track.mp3_path),
-                "cover_path": str(track.cover_path) if track.cover_path else None,
-                "thumb_path": str(track.thumb_path) if track.thumb_path else None,
-                "chat_id": chat_id,
-                "status_msg_id": status_msg_id,
-                "source": track.source,
-                "genre": track.genre,
-                "query": clean_query,
-                "folder_path": str(track.folder_path)
-            }
-            (track.folder_path / "meta.json").write_text(json.dumps(track_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            # Upload audio with thumbnail
-            upload_res = None
-            with open(track.mp3_path, 'rb') as audio_file:
-                files = {'audio': (track.mp3_path.name, audio_file, 'audio/mpeg')}
-                data = {
-                    'chat_id': str(chat_id),
-                    'title': track.title,
-                    'performer': track.artist,
-                    'duration': track.duration,
-                    'caption': caption,
-                    'parse_mode': 'HTML',
-                    'reply_markup': json.dumps(reply_markup)
+                # Metadata for callback button handling
+                track_meta = {
+                    "id": track.id,
+                    "title": track.title,
+                    "artist": track.artist,
+                    "duration": track.duration,
+                    "mp3_path": str(track.mp3_path),
+                    "cover_path": str(track.cover_path) if track.cover_path else None,
+                    "thumb_path": str(track.thumb_path) if track.thumb_path else None,
+                    "chat_id": chat_id,
+                    "status_msg_id": status_msg_id,
+                    "source": track.source,
+                    "genre": track.genre,
+                    "query": clean_query,
+                    "folder_path": str(track.folder_path)
                 }
+                (track.folder_path / "meta.json").write_text(json.dumps(track_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-                if track.thumb_path and track.thumb_path.exists():
-                    with open(track.thumb_path, 'rb') as thumb_file:
-                        files['thumbnail'] = (track.thumb_path.name, thumb_file, 'image/jpeg')
+                # Upload audio with thumbnail
+                upload_res = None
+                with open(track.mp3_path, 'rb') as audio_file:
+                    files = {'audio': (track.mp3_path.name, audio_file, 'audio/mpeg')}
+                    data = {
+                        'chat_id': str(chat_id),
+                        'title': track.title,
+                        'performer': track.artist,
+                        'duration': track.duration,
+                        'caption': caption,
+                        'parse_mode': 'HTML',
+                        'reply_markup': json.dumps(reply_markup)
+                    }
+
+                    if track.thumb_path and track.thumb_path.exists():
+                        with open(track.thumb_path, 'rb') as thumb_file:
+                            files['thumbnail'] = (track.thumb_path.name, thumb_file, 'image/jpeg')
+                            upload_res = self._api_call("sendAudio", files=files, data=data, timeout=90)
+                    else:
                         upload_res = self._api_call("sendAudio", files=files, data=data, timeout=90)
+
+                # Delete searching... status message once delivered
+                if status_msg_id:
+                    self.delete_message(chat_id, status_msg_id)
+
+                if upload_res.get("ok"):
+                    # Save uploaded file_id into meta.json and SQLite cache
+                    result_audio = upload_res.get("result", {}).get("audio", {})
+                    file_id = result_audio.get("file_id")
+                    if file_id:
+                        track_meta["file_id"] = file_id
+                        (track.folder_path / "meta.json").write_text(json.dumps(track_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                        self.db.save_cached_track(
+                            clean_query,
+                            track.artist,
+                            track.title,
+                            track.duration,
+                            file_id,
+                            genre=track.genre
+                        )
                 else:
-                    upload_res = self._api_call("sendAudio", files=files, data=data, timeout=90)
+                    logger.error(f"Failed to send audio preview: {upload_res}")
+                    self.send_message(chat_id, f"❌ Ошибка отправки аудио в Telegram: {upload_res.get('description')}")
 
-            # Delete searching... status message once delivered
-            if status_msg_id:
-                self.delete_message(chat_id, status_msg_id)
+            except Exception as e:
+                logger.error(f"Error processing music '{clean_query}': {e}")
+                fail_text = f"❌ Не удалось найти или скачать трек: <i>{clean_query}</i>\nОшибка: {e}"
+                if status_msg_id:
+                    self.edit_message(chat_id, status_msg_id, fail_text)
+                else:
+                    self.send_message(chat_id, fail_text)
 
-            if upload_res.get("ok"):
-                # Save uploaded file_id into meta.json and SQLite cache
-                result_audio = upload_res.get("result", {}).get("audio", {})
-                file_id = result_audio.get("file_id")
-                if file_id:
-                    track_meta["file_id"] = file_id
-                    (track.folder_path / "meta.json").write_text(json.dumps(track_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-                    self.db.save_cached_track(
-                        clean_query,
-                        track.artist,
-                        track.title,
-                        track.duration,
-                        file_id,
-                        genre=track.genre
-                    )
-            else:
-                logger.error(f"Failed to send audio preview: {upload_res}")
-                self.send_message(chat_id, f"❌ Ошибка отправки аудио в Telegram: {upload_res.get('description')}")
-
-        except Exception as e:
-            logger.error(f"Error processing music '{clean_query}': {e}")
-            fail_text = f"❌ Не удалось найти или скачать трек: <i>{clean_query}</i>\nОшибка: {e}"
-            if status_msg_id:
-                self.edit_message(chat_id, status_msg_id, fail_text)
-            else:
-                self.send_message(chat_id, fail_text)
+        finally:
+            stop_action.set()
+            with self._lock:
+                self.active_searches.discard(search_lock_key)
 
     def handle_callback_query(self, cb: dict):
         """Validates track_id, checks authorization, prevents race conditions, dispatches task."""
@@ -986,6 +1031,8 @@ class MusicBot:
 
         parts = raw_text.split()
         cmd = parts[0].lower() if parts else ""
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
         args = parts[1:] if len(parts) > 1 else []
 
         if cmd in ("/start", "/help"):
@@ -1180,10 +1227,19 @@ class MusicBot:
                 direct_url=direct_url
             )
         else:
+            hint_artist = None
+            hint_title = None
+            # Check for "Artist - Title" format (supports -, —, –)
+            parts = re.split(r'\s+[-—–]\s+', text, maxsplit=1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                hint_artist, hint_title = parts[0].strip(), parts[1].strip()
+
             self.process_search_and_preview(
                 text,
                 chat_id,
-                reply_to_msg_id
+                reply_to_msg_id,
+                hint_artist=hint_artist,
+                hint_title=hint_title
             )
 
     def _task_handle_playlist(self, chat_id: str, playlist_url: str):

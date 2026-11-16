@@ -35,6 +35,7 @@ class Settings:
     temp_expiration_sec: int
     cache_expiration_days: int
     download_dir: Path
+    telegram_proxy: Optional[str] = None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -75,6 +76,12 @@ class Settings:
 
         download_dir = BASE_DIR / "downloads"
 
+        raw_proxy = os.getenv("TELEGRAM_PROXY", "http://127.0.0.1:1080").strip()
+        if raw_proxy.lower() in ("none", "direct", "off", "false", ""):
+            telegram_proxy = None
+        else:
+            telegram_proxy = raw_proxy
+
         return cls(
             bot_token=bot_token,
             chat_id=chat_id,
@@ -84,7 +91,8 @@ class Settings:
             max_workers=max_workers,
             temp_expiration_sec=temp_expiration_sec,
             cache_expiration_days=cache_expiration_days,
-            download_dir=download_dir
+            download_dir=download_dir,
+            telegram_proxy=telegram_proxy
         )
 
 # Global settings instance
