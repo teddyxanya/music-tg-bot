@@ -216,6 +216,45 @@ class MusicBot:
         else:
             self.send_message(chat_id, text, reply_markup=reply_markup)
 
+    def show_shazam_info(self, chat_id: str, user_id: str, edit_msg_id: Optional[int] = None):
+        """Displays user's personal iOS Shazam Shortcuts webhook URL and setup instructions."""
+        # For owner, preserve legacy secret if not set yet
+        default_token = self.settings.shazam_secret if user_id == str(self.settings.chat_id or "78740357") else None
+        token = self.db.get_or_create_shazam_token(user_id, default_token=default_token)
+        base_url = self.settings.shazam_base_url
+        link_url = f"{base_url}/shazam?token={token}&artist=Распознавание музыки (Артист)&title=Распознавание музыки (Название)"
+
+        text = (
+            "📱 <b>Интеграция с Apple Быстрые команды (iOS Shazam)</b>\n\n"
+            "Распознавайте треки через Shazam на iPhone/Apple Watch и отправляйте их боту в 1 тап!\n\n"
+            "🔗 <b>Ваша личная ссылка для Быстрой команды:</b>\n"
+            f"<code>{link_url}</code>\n"
+            "<i>(нажмите на ссылку выше, чтобы скопировать её в буфер)</i>\n\n"
+            "📋 <b>Инструкция по настройке в приложении «Команды» (Shortcuts):</b>\n"
+            "1. Откройте приложение <b>«Команды»</b> на iPhone и нажмите <b>«+»</b> (Создать).\n"
+            "2. Добавьте действие <b>«Распознать песню через Shazam»</b> (Shazam It).\n"
+            "3. Добавьте действие <b>«Текст»</b> и вставьте вашу персональную ссылку выше.\n"
+            "4. В тексте ссылки замените шаблоны на переменные из Shazam:\n"
+            "   • Вместо слова <code>Распознавание музыки (Артист)</code> выберите переменную <b>«Артист»</b>\n"
+            "   • Вместо слова <code>Распознавание музыки (Название)</code> выберите переменную <b>«Название»</b>\n"
+            "5. Добавьте действие <b>«Получить содержимое URL»</b> (передав туда результат блока «Текст»).\n"
+            "   • Метод: <b>GET</b>\n"
+            "6. <b>Готово!</b> Добавьте команду в Виджеты, на экран блокировки, в Action Button или вызывайте через Siri: <i>«Привет, Siri, Shazam»</i>.\n\n"
+            "🎵 Распознанный трек мгновенно прилетит сюда в бота с кнопкой «Закинуть в канал»!"
+        )
+
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "🔄 Сгенерировать новый токен", "callback_data": "shazam:new_token"}],
+                [{"text": "📋 Мои каналы", "callback_data": "channels:list"}]
+            ]
+        }
+
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=reply_markup)
+        else:
+            self.send_message(chat_id, text, reply_markup=reply_markup)
+
     def handle_my_chat_member(self, mcm: dict):
         """
         Catches real-time Telegram updates when the bot is added to a channel/group,
@@ -582,6 +621,21 @@ class MusicBot:
             self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id})
             self.show_channels_menu(chat_id, from_user_id, edit_msg_id=msg_id)
             return
+
+        # Shazam webhook callbacks
+        if action == "shazam":
+            if param == "new_token":
+                self.db.regenerate_shazam_token(from_user_id)
+                self._api_call("answerCallbackQuery", json_data={
+                    "callback_query_id": cb_id,
+                    "text": "✅ Сгенерирован новый персональный токен!"
+                })
+                self.show_shazam_info(chat_id, from_user_id, edit_msg_id=msg_id)
+                return
+            if param == "info":
+                self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id})
+                self.show_shazam_info(chat_id, from_user_id, edit_msg_id=msg_id)
+                return
 
         # 1. Dismiss notification
         if action == "dismiss":
@@ -1048,10 +1102,22 @@ class MusicBot:
                 "• <code>/channels</code> — Управление подключенными каналами и добавление в 1 клик\n"
                 "• <code>/mychannel</code> — Посмотреть текущий активный канал\n"
                 "• <code>/clearchannel</code> — Сбросить выбор активного канала\n\n"
+                "📱 <b>Интеграция с iPhone / iOS:</b>\n"
+                "• <code>/shazam</code> — Личная ссылка для Apple Быстрых команд (Shazam в 1 тап)\n\n"
                 "📊 <b>Статус:</b>\n"
                 "• <code>/status</code> — Статистика воркеров, кэша и диска"
             )
-            self.send_message(chat_id, help_text)
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": "📱 Быстрая команда Shazam (iOS)", "callback_data": "shazam:info"}],
+                    [{"text": "📋 Мои каналы", "callback_data": "channels:list"}]
+                ]
+            }
+            self.send_message(chat_id, help_text, reply_markup=reply_markup)
+            return
+
+        if cmd in ("/shazam", "/ios", "/shortcut", "/shortcuts"):
+            self.show_shazam_info(chat_id, sender_id)
             return
 
         if cmd in ("/channels", "/channel"):

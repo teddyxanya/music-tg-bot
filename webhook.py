@@ -47,11 +47,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
         )
         return token
 
-    def _validate_auth(self, token: str) -> bool:
-        if not self.settings.shazam_secret:
-            logger.error("SHAZAM_SECRET_TOKEN is not configured! Denying webhook request.")
-            return False
-        return hmac.compare_digest(token or "", self.settings.shazam_secret)
+    def _resolve_user(self, token: str) -> Optional[str]:
+        """
+        Resolves the Telegram user ID from the personal Shazam token.
+        Falls back to legacy global shazam_secret for backwards compatibility.
+        """
+        if not token:
+            return None
+
+        clean_token = token.strip()
+        # 1. Check user-specific token from database if available
+        if hasattr(self.bot, "db") and self.bot.db is not None:
+            try:
+                user_id = self.bot.db.get_user_by_shazam_token(clean_token)
+                if user_id:
+                    return str(user_id)
+            except Exception as e:
+                logger.warning(f"Error querying shazam token in db: {e}")
+
+        # 2. Backwards compatibility: legacy global shazam_secret routes to owner/default chat
+        if self.settings.shazam_secret and hmac.compare_digest(clean_token, self.settings.shazam_secret):
+            return str(self.settings.chat_id or "78740357")
+
+        return None
 
     def _parse_params(self, qs: dict) -> Tuple[str, str, str]:
         q = (qs.get("q", [""])[0] or qs.get("track", [""])[0] or qs.get("query", [""])[0]).strip()
@@ -84,7 +102,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if path in ("/shazam", "/music"):
             token = self._extract_auth_token(qs)
-            if not self._validate_auth(token):
+            user_id = self._resolve_user(token)
+            if not user_id:
                 logger.warning(f"Unauthorized GET /shazam from {self.client_address[0]}")
                 self._send_json(403, {"ok": False, "error": "Forbidden: invalid or missing token"})
                 return
@@ -94,10 +113,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "Missing ?q= or ?artist=&title= parameter"})
                 return
 
-            # Dispatch task asynchronously to bot thread pool
+            # Dispatch task asynchronously to bot thread pool for this specific user
             self.bot.executor.submit(
                 self.bot.process_search_and_preview,
                 q,
+                target_chat_id=user_id,
                 hint_artist=artist if artist else None,
                 hint_title=title if title else None
             )
@@ -105,6 +125,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "ok": True,
                 "status": "processing",
+                "user_id": user_id,
                 "query": q,
                 "artist": artist,
                 "title": title,
@@ -141,7 +162,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 if isinstance(token, list):
                     token = token[0] if token else ""
 
-            if not self._validate_auth(token):
+            user_id = self._resolve_user(token)
+            if not user_id:
                 logger.warning(f"Unauthorized POST /shazam from {self.client_address[0]}")
                 self._send_json(403, {"ok": False, "error": "Forbidden: invalid or missing token"})
                 return
@@ -186,10 +208,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "Missing query or artist/title"})
                 return
 
-            # Dispatch task asynchronously
+            # Dispatch task asynchronously for this specific user
             self.bot.executor.submit(
                 self.bot.process_search_and_preview,
                 q,
+                target_chat_id=user_id,
                 hint_artist=clean_art if clean_art != "Неизвестен" else None,
                 hint_title=clean_tit if clean_tit != "Без названия" else None
             )
@@ -197,6 +220,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "ok": True,
                 "status": "processing",
+                "user_id": user_id,
                 "query": q,
                 "artist": clean_art,
                 "title": clean_tit,

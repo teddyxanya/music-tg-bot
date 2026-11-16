@@ -249,6 +249,8 @@ class TestWebhookEndpoints(unittest.TestCase):
         self.settings.shazam_secret = "test_secret_123"
         self.mock_bot = MagicMock(spec=MusicBot)
         self.mock_bot.executor = MagicMock()
+        self.mock_bot.db = MagicMock()
+        self.mock_bot.db.get_user_by_shazam_token.return_value = None
 
     def _create_handler(self, method: str, path: str, headers: dict = None, body: bytes = b""):
         handler = WebhookHandler.__new__(WebhookHandler)
@@ -421,6 +423,35 @@ class TestMultiUserAndDeduplication(unittest.TestCase):
         sent_text = self.bot.send_message.call_args[0][1]
         self.assertIn("Статус Music Bot", sent_text)
         self.assertIn("Воркеров:", sent_text)
+
+    def test_user_shazam_token_generation_and_lookup(self):
+        token = self.bot.db.get_or_create_shazam_token("user_999")
+        self.assertTrue(len(token) >= 32)
+        
+        # Verify token maps back to user_999
+        resolved_user = self.bot.db.get_user_by_shazam_token(token)
+        self.assertEqual(resolved_user, "user_999")
+
+        # Test regeneration
+        new_token = self.bot.db.regenerate_shazam_token("user_999")
+        self.assertNotEqual(token, new_token)
+        self.assertEqual(self.bot.db.get_user_by_shazam_token(new_token), "user_999")
+        self.assertIsNone(self.bot.db.get_user_by_shazam_token(token))
+
+    def test_shazam_command_displays_personal_link(self):
+        msg = {
+            "chat": {"id": "user_777"},
+            "from": {"id": "user_777"},
+            "text": "/shazam"
+        }
+        self.bot.handle_message(msg)
+        self.bot.send_message.assert_called_once()
+        args, kwargs = self.bot.send_message.call_args
+        sent_text = args[1]
+        self.assertIn("Интеграция с Apple Быстрые команды", sent_text)
+        token = self.bot.db.get_or_create_shazam_token("user_777")
+        self.assertIn(f"token={token}", sent_text)
+        self.assertIn("Распознавание музыки (Артист)", sent_text)
 
 if __name__ == "__main__":
     unittest.main()

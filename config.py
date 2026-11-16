@@ -35,6 +35,7 @@ class Settings:
     temp_expiration_sec: int
     cache_expiration_days: int
     download_dir: Path
+    shazam_base_url: str = "http://194.87.196.158:8081"
     telegram_proxy: Optional[str] = None
 
     @classmethod
@@ -82,6 +83,8 @@ class Settings:
         else:
             telegram_proxy = raw_proxy
 
+        shazam_base_url = os.getenv("SHAZAM_BASE_URL", "http://194.87.196.158:8081").strip().rstrip("/")
+
         return cls(
             bot_token=bot_token,
             chat_id=chat_id,
@@ -92,6 +95,7 @@ class Settings:
             temp_expiration_sec=temp_expiration_sec,
             cache_expiration_days=cache_expiration_days,
             download_dir=download_dir,
+            shazam_base_url=shazam_base_url,
             telegram_proxy=telegram_proxy
         )
 

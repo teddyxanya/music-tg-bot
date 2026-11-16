@@ -5,6 +5,7 @@ tag history, channel publishing records, user channel preferences, and cache ret
 """
 
 import time
+import secrets
 import sqlite3
 import logging
 import contextlib
@@ -89,6 +90,16 @@ class Database:
                     updated_at REAL NOT NULL
                 );
             """)
+
+            # Personal Shazam / Apple Shortcuts tokens for each user
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_shazam_tokens (
+                    user_id TEXT PRIMARY KEY,
+                    token TEXT UNIQUE NOT NULL,
+                    created_at REAL NOT NULL
+                );
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_shazam_token ON user_shazam_tokens(token);")
             conn.commit()
             logger.info(f"Database initialized in WAL mode at {self.db_path}")
 
@@ -329,3 +340,56 @@ class Database:
             if deleted > 0:
                 logger.info(f"Cleaned up {deleted} expired track cache records older than {max_age_seconds}s")
             return deleted
+
+    # Personal Shazam / Apple Shortcuts token management
+    def get_or_create_shazam_token(self, user_id: str, default_token: Optional[str] = None) -> str:
+        """Returns existing secret token for user, or generates a new 32-char hex token."""
+        if not user_id:
+            return ""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT token FROM user_shazam_tokens WHERE user_id = ? LIMIT 1", (str(user_id),))
+            row = cursor.fetchone()
+            if row:
+                return row["token"]
+
+            new_token = default_token or secrets.token_hex(16)
+            now = time.time()
+            cursor.execute("""
+                INSERT INTO user_shazam_tokens (user_id, token, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET token = excluded.token
+            """, (str(user_id), new_token, now))
+            conn.commit()
+            return new_token
+
+    def regenerate_shazam_token(self, user_id: str) -> str:
+        """Generates and updates a fresh secret token for the user."""
+        if not user_id:
+            return ""
+        new_token = secrets.token_hex(16)
+        now = time.time()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO user_shazam_tokens (user_id, token, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    token = excluded.token,
+                    created_at = excluded.created_at
+            """, (str(user_id), new_token, now))
+            conn.commit()
+            return new_token
+
+    def get_user_by_shazam_token(self, token: str) -> Optional[str]:
+        """Looks up user_id associated with the personal Shazam token."""
+        if not token:
+            return None
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id FROM user_shazam_tokens WHERE token = ? LIMIT 1",
+                (str(token).strip(),)
+            )
+            row = cursor.fetchone()
+            return str(row["user_id"]) if row else None
