@@ -1,7 +1,7 @@
 """
 Telegram Bot Controller.
 Handles long-polling, callback queries, non-blocking ThreadPool execution,
-instant SQLite file_id caching, audio previewing, channel publishing with genre tags,
+instant SQLite file_id caching, audio previewing, multi-user channel publishing with genre tags,
 alternative versions selector, tag editing, lyrics display, and direct link parsing.
 """
 
@@ -13,7 +13,7 @@ import shutil
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, Set, Dict, Any, List
+from typing import Optional, Set, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -68,6 +68,17 @@ class MusicBot:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
+        # Authenticate bot info for rights verification in channels/groups
+        me = self._api_call("getMe")
+        if me.get("ok"):
+            self.bot_id = str(me["result"]["id"])
+            self.bot_username = me["result"].get("username", "")
+            logger.info(f"Bot authenticated as @{self.bot_username} (ID: {self.bot_id})")
+        else:
+            self.bot_id = None
+            self.bot_username = ""
+            logger.warning(f"Could not fetch getMe info: {me}")
+
     def _api_call(self, method: str, json_data: dict = None, files: dict = None, data: dict = None, timeout: int = 30) -> dict:
         url = f"https://api.telegram.org/bot{self.settings.bot_token}/{method}"
         try:
@@ -108,7 +119,7 @@ class MusicBot:
         self._api_call("editMessageText", json_data=payload, timeout=10)
 
     def cleanup_expired_pending(self):
-        """Purges pending download directories older than configured expiration time."""
+        """Purges pending download directories older than configured expiration time and expired DB cache entries."""
         now = time.time()
         try:
             for item in self.settings.download_dir.iterdir():
@@ -118,32 +129,35 @@ class MusicBot:
                             continue
                     shutil.rmtree(item, ignore_errors=True)
                     logger.info(f"Cleaned up expired track folder: {item.name}")
+
+            if self.settings.cache_expiration_days > 0:
+                self.db.cleanup_old_cache(self.settings.cache_expiration_days * 86400)
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
 
     def is_authorized(self, sender_id: str) -> bool:
-        """Returns True if sender is authorized (owner or owner unset)."""
-        if not self.settings.owner_id:
-            return True
-        return str(sender_id) == str(self.settings.owner_id)
+        """Returns True. Access control is managed via Telegram bot settings."""
+        return True
 
-    def forward_to_sub_server(self, cmd: str, args: List[str], sender_id: str = "", chat_id: str = "") -> Optional[dict]:
-        """Forwards proxy/subscription commands to the local e0f sub server daemon."""
-        try:
-            url = f"{self.settings.sub_server_url.rstrip('/')}/api/tg_command"
-            payload = {
-                "cmd": cmd,
-                "args": args,
-                "sender_user_id": sender_id,
-                "chat_id": chat_id
-            }
-            resp = requests.post(url, json=payload, timeout=90)
-            if resp.status_code == 200:
-                return resp.json()
-            logger.error(f"Sub-server returned HTTP {resp.status_code}: {resp.text}")
-        except Exception as e:
-            logger.warning(f"Could not connect to sub-server ({self.settings.sub_server_url}): {e}")
-        return None
+    def get_user_target_channel(self, user_id: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Resolves target channel and title for a user or chat.
+        Returns (target_channel, channel_title).
+        Priority:
+        1. User-specific setting in DB (from user_id)
+        2. Chat-specific setting in DB (if in group)
+        3. Default channel from settings.default_channel_id
+        """
+        setting = None
+        if user_id:
+            setting = self.db.get_user_channel(str(user_id))
+        if not setting and chat_id:
+            setting = self.db.get_user_channel(str(chat_id))
+        if setting and setting.get("target_channel"):
+            return setting["target_channel"], setting.get("target_channel_title") or "Канал"
+        if self.settings.default_channel_id:
+            return self.settings.default_channel_id, "Канал"
+        return None, None
 
     def process_search_and_preview(
         self,
@@ -159,7 +173,7 @@ class MusicBot:
         sends preview MP3 with interactive buttons (Publish, Cancel, Versions, Lyrics, Edit tags).
         Falls back to fresh download if cached file_id fails.
         """
-        chat_id = target_chat_id or self.settings.chat_id or self.settings.owner_id
+        chat_id = target_chat_id or self.settings.chat_id
         if not chat_id:
             logger.error("No valid chat_id available to send preview")
             return
@@ -173,12 +187,14 @@ class MusicBot:
                 logger.info(f"Instant cache hit for '{clean_query}': file_id {cached['file_id']}")
                 m, s = divmod(cached["duration"], 60)
                 dur_str = f"{m}:{s:02d}"
+                _, ch_title = self.get_user_target_channel(chat_id)
+                ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
                 caption = (
                     f"⚡ <b>Мгновенно из кэша (0.1 сек):</b>\n"
                     f"🎵 <b>{cached['artist']} — {cached['title']}</b>\n"
                     f"⏱ Длительность: <code>{dur_str}</code>\n"
                     f"🏷 Жанр: {cached.get('genre') or '#музыка'}\n\n"
-                    f"Опубликовать в канале «Свалка треков»?"
+                    f"Опубликовать {ch_prompt}?"
                 )
                 reply_markup = {
                     "inline_keyboard": [
@@ -224,12 +240,14 @@ class MusicBot:
             dur_str = f"{m}:{s:02d}"
 
             source_icon = "🎥 YouTube" if track.source == "youtube" else "☁️ SoundCloud"
+            _, ch_title = self.get_user_target_channel(chat_id)
+            ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
             caption = (
                 f"🎧 <b>Найден трек ({source_icon}):</b>\n"
                 f"🎵 <b>{track.artist} — {track.title}</b>\n"
                 f"⏱ Длительность: <code>{dur_str}</code>\n"
                 f"🏷 Жанр: {track.genre}\n\n"
-                f"Опубликовать в канале «Свалка треков»?"
+                f"Опубликовать {ch_prompt}?"
             )
 
             reply_markup = {
@@ -350,14 +368,14 @@ class MusicBot:
         if action == "pubcached":
             if not param.isdigit():
                 return
-            cache_action_key = f"cache_{param}"
+            cache_action_key = f"cache_{param}_{from_user_id}"
             with self._lock:
                 if cache_action_key in self.active_track_actions:
                     self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id, "text": "⏳ Уже публикуется..."})
                     return
                 self.active_track_actions.add(cache_action_key)
             self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id, "text": "🚀 Публикую из кэша..."})
-            self.executor.submit(self._task_publish_cached, int(param), chat_id, msg_id, cache_action_key)
+            self.executor.submit(self._task_publish_cached, int(param), chat_id, msg_id, cache_action_key, from_user_id)
             return
 
         if action == "clyr":
@@ -425,7 +443,7 @@ class MusicBot:
                 return
 
             self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id, "text": "🚀 Публикую в канал..."})
-            self.executor.submit(self._task_publish_track, track_id, track_dir, meta_path, chat_id, msg_id)
+            self.executor.submit(self._task_publish_track, track_id, track_dir, meta_path, chat_id, msg_id, from_user_id)
             return
 
         if action == "alt":
@@ -554,11 +572,22 @@ class MusicBot:
         except Exception as e:
             logger.error(f"Error showing cached lyrics: {e}")
 
-    def _task_publish_cached(self, cached_id: int, chat_id: str, msg_id: int, cache_action_key: str):
+    def _task_publish_cached(self, cached_id: int, chat_id: str, msg_id: int, cache_action_key: str, user_id: str = ""):
         try:
             row = self.db.get_track_by_id(cached_id)
             if not row:
                 self.send_message(chat_id, "⚠️ Запись в кэше не найдена.")
+                return
+
+            target_channel, ch_title = self.get_user_target_channel(user_id, chat_id)
+            if not target_channel:
+                self.send_message(
+                    chat_id,
+                    "⚠️ <b>Канал для публикации не настроен!</b>\n\n"
+                    "Пожалуйста, привяжите ваш канал или группу командой:\n"
+                    "<code>/setchannel @имя_канала</code> или <code>/setchannel -100xxxxxxxxxx</code>\n\n"
+                    "<i>(Не забудьте добавить бота администратором в ваш канал с правом отправки сообщений).</i>"
+                )
                 return
 
             artist = row["artist"]
@@ -567,12 +596,9 @@ class MusicBot:
             file_id = row["file_id"]
             genre = row["genre"] or "#музыка"
 
-            if not self.settings.channel_id:
-                raise ValueError("MUSIC_CHANNEL_ID не задан в .env")
-
             caption = f"🎵 <b>{artist} — {title}</b>\n\n{genre}"
             res = self._api_call("sendAudio", json_data={
-                "chat_id": str(self.settings.channel_id),
+                "chat_id": str(target_channel),
                 "audio": file_id,
                 "title": title,
                 "performer": artist,
@@ -591,7 +617,7 @@ class MusicBot:
             if chat_uname:
                 channel_link = f"https://t.me/{chat_uname}/{channel_msg_id}"
             else:
-                c_id_clean = re.sub(r'^-100', '', str(self.settings.channel_id)).lstrip('-')
+                c_id_clean = re.sub(r'^-100', '', str(target_channel)).lstrip('-')
                 channel_link = f"https://t.me/c/{c_id_clean}/{channel_msg_id}"
 
             # Update channel link in database
@@ -601,7 +627,7 @@ class MusicBot:
                 "chat_id": chat_id,
                 "message_id": msg_id,
                 "caption": (
-                    f"✅ <b>Опубликовано в «Свалка треков»!</b>\n\n"
+                    f"✅ <b>Опубликовано в «{ch_title or 'Канал'}»!</b>\n\n"
                     f"🎵 <b>{artist} — {title}</b>\n"
                     f"🔗 <a href=\"{channel_link}\">Перейти к треку в канале</a>"
                 ),
@@ -635,7 +661,7 @@ class MusicBot:
             with self._lock:
                 self.active_track_actions.discard(track_id)
 
-    def _task_publish_track(self, track_id: str, track_dir: Path, meta_path: Path, chat_id: str, msg_id: int):
+    def _task_publish_track(self, track_id: str, track_dir: Path, meta_path: Path, chat_id: str, msg_id: int, user_id: str = ""):
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             title = meta["title"]
@@ -645,21 +671,29 @@ class MusicBot:
             thumb_path = Path(meta["thumb_path"]) if meta.get("thumb_path") else None
             genre = meta.get("genre") or "#музыка"
 
-            if not self.settings.channel_id:
-                raise ValueError("MUSIC_CHANNEL_ID не задан в .env")
+            target_channel, ch_title = self.get_user_target_channel(user_id, chat_id)
+            if not target_channel:
+                self.send_message(
+                    chat_id,
+                    "⚠️ <b>Канал для публикации не настроен!</b>\n\n"
+                    "Пожалуйста, привяжите ваш канал или группу командой:\n"
+                    "<code>/setchannel @имя_канала</code> или <code>/setchannel -100xxxxxxxxxx</code>\n\n"
+                    "<i>(Не забудьте добавить бота администратором в ваш канал с правом отправки сообщений).</i>"
+                )
+                return
 
             # Check file size limit before channel upload
             file_size = mp3_path.stat().st_size
             if file_size > MAX_TELEGRAM_AUDIO_BYTES:
                 raise Exception(f"Файл слишком большой ({file_size // (1024*1024)} МБ) для отправки в Telegram.")
 
-            # Upload MP3 directly to music channel with genre hashtags
+            # Upload MP3 directly to target channel with genre hashtags
             res = None
             with open(mp3_path, 'rb') as audio_file:
                 files = {'audio': (mp3_path.name, audio_file, 'audio/mpeg')}
                 caption = f"🎵 <b>{artist} — {title}</b>\n\n{genre}"
                 data = {
-                    'chat_id': str(self.settings.channel_id),
+                    'chat_id': str(target_channel),
                     'title': title,
                     'performer': artist,
                     'duration': duration,
@@ -685,7 +719,7 @@ class MusicBot:
             if chat_uname:
                 channel_link = f"https://t.me/{chat_uname}/{channel_msg_id}"
             else:
-                c_id_clean = re.sub(r'^-100', '', str(self.settings.channel_id)).lstrip('-')
+                c_id_clean = re.sub(r'^-100', '', str(target_channel)).lstrip('-')
                 channel_link = f"https://t.me/c/{c_id_clean}/{channel_msg_id}"
 
             # Save / update in SQLite cache
@@ -705,7 +739,7 @@ class MusicBot:
                 "chat_id": chat_id,
                 "message_id": msg_id,
                 "caption": (
-                    f"✅ <b>Опубликовано в «Свалка треков»!</b>\n\n"
+                    f"✅ <b>Опубликовано в «{ch_title or 'Канал'}»!</b>\n\n"
                     f"🎵 <b>{artist} — {title}</b>\n"
                     f"🔗 <a href=\"{channel_link}\">Перейти к треку в канале</a>"
                 ),
@@ -715,7 +749,7 @@ class MusicBot:
 
             # Cleanup temp folder
             shutil.rmtree(track_dir, ignore_errors=True)
-            logger.info(f"Published track {artist} - {title} to channel {self.settings.channel_id}")
+            logger.info(f"Published track {artist} - {title} to channel {target_channel}")
 
         except Exception as e:
             logger.error(f"Error publishing track: {e}")
@@ -752,87 +786,140 @@ class MusicBot:
 
         if cmd in ("/start", "/help"):
             help_text = (
-                "🤖 <b>Единый бот: Прокси-чекер & Музыка</b>\n\n"
-                "🌐 <b>Управление прокси и подписками (Gemini):</b>\n"
-                "• 📊 <code>/status</code> — Общий статус серверов, кэша и Gemini\n"
-                "• 📋 <code>/profiles</code> — Список всех профилей и подписок Shadowrocket\n"
-                "• ➕ <code>/newprofile &lt;имя&gt;</code> — Создать профиль и выделить AWG-серверы\n"
-                "• ➖ <code>/delprofile &lt;имя&gt;</code> — Удалить профиль и освободить слоты\n"
-                "• 🔄 <code>/sync</code> — Принудительная синхронизация с e0f.cx\n"
-                "• 🔎 <code>/check</code> — Запуск теста Gemini серверов (Web + API)\n\n"
-                "🎵 <b>Музыкальный плеер и загрузчик:</b>\n"
-                "• Отправьте название трека или ссылку (YouTube, SoundCloud, Spotify, Apple, Яндекс)\n"
+                "🎵 <b>Telegram Music Bot & Downloader</b>\n\n"
+                "🔍 <b>Поиск и скачивание музыки:</b>\n"
+                "• Отправьте название трека или исполнителя (например, <code>2Pac Hail Mary</code>)\n"
+                "• Отправьте ссылку на трек или альбом (YouTube, SoundCloud, Spotify, Apple Music, Яндекс Музыка)\n"
                 "• <code>/music &lt;название&gt;</code> — Скачать MP3 (320 kbps, обложка 1:1, EBU R128)\n"
-                "• <code>/album &lt;ссылка&gt;</code> — Пакетное скачивание плейлиста или альбома\n"
-                "• <code>/lyrics &lt;трек&gt;</code> — Поиск и показ слов песни\n"
-                "• <code>/mstatus</code> — Детальный статус только музыкального модуля"
+                "• <code>/album &lt;ссылка&gt;</code> — Пакетное скачивание альбома / плейлиста\n"
+                "• <code>/lyrics &lt;трек&gt;</code> — Поиск и показ слов песни\n\n"
+                "📢 <b>Настройка вашего канала / группы:</b>\n"
+                "• <code>/setchannel &lt;@канал или ID&gt;</code> — Привязать целевой канал/группу\n"
+                "• <code>/mychannel</code> — Посмотреть текущий канал для публикации\n"
+                "• <code>/clearchannel</code> — Отвязать канал\n\n"
+                "📊 <b>Статус:</b>\n"
+                "• <code>/status</code> — Статистика воркеров, кэша и диска"
             )
             self.send_message(chat_id, help_text)
             return
 
-        if cmd == "/status":
-            num_workers = self.settings.max_workers
-            disk_items = len(list(self.settings.download_dir.glob("*")))
-            with self._lock:
-                active_count = len(self.active_track_actions)
-            cache_count = self.db.count_cached_tracks()
+        if cmd in ("/setchannel", "/setgroup"):
+            target = args[0].strip() if args else ""
+            if not target:
+                self.send_message(
+                    chat_id,
+                    "⚠️ <b>Как привязать канал или группу для музыки:</b>\n\n"
+                    "1. Добавьте бота в ваш канал или группу как <b>Администратора</b> (с правом публикации сообщений).\n"
+                    "2. Отправьте команду:\n"
+                    "<code>/setchannel @username_канала</code>\n"
+                    "или укажите числовой ID:\n"
+                    "<code>/setchannel -100xxxxxxxxxx</code>\n\n"
+                    "<i>Чтобы узнать текущую привязку: /mychannel\n"
+                    "Чтобы отвязать: /clearchannel</i>"
+                )
+                return
 
-            music_block = (
-                "🎵 <b>Статус Music Bot:</b>\n"
-                f"⚙️ Воркеров: <code>{num_workers}</code> (активных задач: <code>{active_count}</code>)\n"
-                f"⚡ Треков в кэше: <code>{cache_count}</code>\n"
-                f"📁 Временных файлов: <code>{disk_items}</code>\n"
-                f"📢 Канал: <code>{self.settings.channel_id or 'Не настроен'}</code>"
+            chat_info = self._api_call("getChat", json_data={"chat_id": target})
+            if not chat_info.get("ok"):
+                desc = chat_info.get("description", "Чат не найден")
+                self.send_message(
+                    chat_id,
+                    f"❌ <b>Не удалось найти канал/группу <code>{target}</code></b>\n\n"
+                    f"Telegram ответил: <i>{desc}</i>\n\n"
+                    "💡 <b>Решение:</b>\n"
+                    f"1. Добавьте бота (@{self.bot_username or 'бота'}) в этот канал или группу.\n"
+                    "2. Назначьте его <b>Администратором</b> (право «Публикация сообщений» / «Post messages»).\n"
+                    f"3. Повторите команду: <code>/setchannel {target}</code>"
+                )
+                return
+
+            res_obj = chat_info.get("result", {})
+            title = res_obj.get("title") or res_obj.get("username") or str(target)
+            target_id = str(res_obj.get("id", target))
+
+            if self.bot_id:
+                member_info = self._api_call("getChatMember", json_data={"chat_id": target_id, "user_id": self.bot_id})
+                if member_info.get("ok"):
+                    status = member_info.get("result", {}).get("status", "")
+                    if status not in ("administrator", "creator"):
+                        self.send_message(
+                            chat_id,
+                            f"⚠️ <b>Внимание:</b> Бот состоит в «{title}», но статус <code>{status}</code> (не администратор).\n"
+                            "Убедитесь, что боту разрешено публиковать сообщения."
+                        )
+
+            self.db.set_user_channel(sender_id, target_id, title)
+            if chat_id != sender_id:
+                self.db.set_user_channel(chat_id, target_id, title)
+
+            self.send_message(
+                chat_id,
+                f"✅ <b>Канал успешно привязан!</b>\n\n"
+                f"📢 <b>{title}</b> (<code>{target_id}</code>)\n\n"
+                "Теперь при нажатии «Закинуть в канал» треки будут отправляться в ваш канал!"
             )
-
-            sub_res = self.forward_to_sub_server("/status", [], sender_id, chat_id)
-            if sub_res and sub_res.get("text"):
-                status_text = f"{sub_res['text']}\n\n━━━━━━━━━━━━━━━━━━━━\n{music_block}"
-            else:
-                status_text = f"📊 <b>Статус Gemini Checker</b>\n⚠️ Сервис недоступен (порт 8088)\n\n━━━━━━━━━━━━━━━━━━━━\n{music_block}"
-
-            self.send_message(chat_id, status_text)
             return
 
-        if cmd == "/mstatus":
+        if cmd == "/mychannel":
+            target_ch, ch_title = self.get_user_target_channel(sender_id, chat_id)
+            if target_ch:
+                self.send_message(
+                    chat_id,
+                    f"📢 <b>Ваш текущий канал для публикации:</b>\n\n"
+                    f"• Название: <b>{ch_title}</b>\n"
+                    f"• ID / Username: <code>{target_ch}</code>\n\n"
+                    "<i>Чтобы изменить: <code>/setchannel @username</code>\n"
+                    "Чтобы сбросить привязку: <code>/clearchannel</code></i>"
+                )
+            else:
+                self.send_message(
+                    chat_id,
+                    "📢 <b>Канал для публикации пока не привязан.</b>\n\n"
+                    "Чтобы треки публиковались в ваш канал или группу:\n"
+                    "1. Добавьте бота администратором в ваш канал/группу.\n"
+                    "2. Отправьте: <code>/setchannel @username</code> или <code>/setchannel -100xxxxxxxxxx</code>"
+                )
+            return
+
+        if cmd == "/clearchannel":
+            cleared = self.db.clear_user_channel(sender_id)
+            if chat_id != sender_id:
+                self.db.clear_user_channel(chat_id)
+            if cleared:
+                self.send_message(
+                    chat_id,
+                    "🗑️ <b>Привязка канала удалена.</b>\n\n"
+                    "Вы можете настроить новый канал в любое время командой <code>/setchannel @username</code>."
+                )
+            else:
+                self.send_message(
+                    chat_id,
+                    "ℹ️ У вас не было настроено персонального канала.\n"
+                    "Привязать канал можно командой: <code>/setchannel @username</code>"
+                )
+            return
+
+        if cmd in ("/status", "/mstatus"):
             num_workers = self.settings.max_workers
             disk_items = len(list(self.settings.download_dir.glob("*")))
             with self._lock:
                 active_count = len(self.active_track_actions)
             cache_count = self.db.count_cached_tracks()
+            target_ch, ch_title = self.get_user_target_channel(sender_id, chat_id)
+            ch_display = f"{ch_title} (<code>{target_ch}</code>)" if target_ch else "<i>Не настроен (/setchannel)</i>"
+            temp_hours = self.settings.temp_expiration_sec // 3600
 
             status_text = (
                 "📊 <b>Статус Music Bot</b>\n\n"
                 f"⚙️ Воркеров: <code>{num_workers}</code> (активных задач: <code>{active_count}</code>)\n"
                 f"⚡ Треков в кэше: <code>{cache_count}</code>\n"
-                f"📁 Временных папок: <code>{disk_items}</code>\n"
-                f"📢 Канал: <code>{self.settings.channel_id or 'Не настроен'}</code>\n"
+                f"📁 Временных файлов на диске: <code>{disk_items}</code>\n"
+                f"⏳ Срок хранения кэша на диске: <code>{temp_hours} ч.</code>\n"
+                f"🗄️ Хранение истории в БД: <code>{self.settings.cache_expiration_days or 'бессрочно'} дн.</code>\n"
+                f"📢 Целевой канал: {ch_display}\n"
                 f"🌐 Webhook порт: <code>{self.settings.port}</code>"
             )
             self.send_message(chat_id, status_text)
-            return
-
-        PROXY_COMMANDS = {
-            "/profiles", "/list",
-            "/newprofile", "/add", "/create",
-            "/delprofile", "/delete", "/del",
-            "/check", "/sync"
-        }
-        if cmd in PROXY_COMMANDS:
-            if cmd in ("/newprofile", "/add", "/create") and args:
-                self.send_message(chat_id, f"⏳ Создаю профиль <b>«{args[0]}»</b> и выделяю AWG-серверы...")
-            elif cmd == "/sync":
-                self.send_message(chat_id, "⏳ Синхронизация всех профилей...")
-
-            res = self.forward_to_sub_server(cmd, args, sender_id, chat_id)
-            if res and res.get("text"):
-                self.send_message(chat_id, res["text"])
-            else:
-                self.send_message(
-                    chat_id,
-                    "⚠️ <b>Сервис прокси-чекера недоступен</b> (порт 8088).\n"
-                    "Проверьте работу службы <code>e0f-sub.service</code> на сервере."
-                )
             return
 
         if cmd in ("/album", "/playlist"):
@@ -961,12 +1048,14 @@ class MusicBot:
             # Update caption of preview message
             m, s = divmod(meta.get("duration", 0), 60)
             dur_str = f"{m}:{s:02d}"
+            _, ch_title = self.get_user_target_channel(chat_id)
+            ch_prompt = f"в канал «{ch_title}»" if ch_title and ch_title != "Канал" else "в канал"
             caption = (
                 f"🎧 <b>Найден трек (теги обновлены):</b>\n"
                 f"🎵 <b>{new_artist} — {new_title}</b>\n"
                 f"⏱ Длительность: <code>{dur_str}</code>\n"
                 f"🏷 Жанр: {meta.get('genre') or '#музыка'}\n\n"
-                f"Опубликовать в канале «Свалка треков»?"
+                f"Опубликовать {ch_prompt}?"
             )
             self._api_call("editMessageCaption", json_data={
                 "chat_id": chat_id,
