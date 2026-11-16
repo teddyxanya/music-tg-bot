@@ -28,7 +28,6 @@ except ImportError:
 class Settings:
     bot_token: str
     chat_id: Optional[str]
-    default_channel_id: Optional[str]
     shazam_secret: str
     host: str
     port: int
@@ -37,23 +36,10 @@ class Settings:
     cache_expiration_days: int
     download_dir: Path
 
-    @property
-    def channel_id(self) -> Optional[str]:
-        """Backward compatibility alias for default_channel_id."""
-        return self.default_channel_id
-
     @classmethod
     def load(cls) -> "Settings":
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip() or None
-        
-        # Default channel can be provided via DEFAULT_MUSIC_CHANNEL_ID or legacy MUSIC_CHANNEL_ID
-        default_channel_id = (
-            os.getenv("DEFAULT_MUSIC_CHANNEL_ID", "").strip() or
-            os.getenv("MUSIC_CHANNEL_ID", "").strip() or
-            None
-        )
-        
         shazam_secret = os.getenv("SHAZAM_SECRET_TOKEN", "").strip()
         host = os.getenv("WEBHOOK_HOST", "127.0.0.1").strip()
         
@@ -92,7 +78,6 @@ class Settings:
         return cls(
             bot_token=bot_token,
             chat_id=chat_id,
-            default_channel_id=default_channel_id,
             shazam_secret=shazam_secret,
             host=host,
             port=port,

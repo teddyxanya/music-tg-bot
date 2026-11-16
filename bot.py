@@ -79,6 +79,12 @@ class MusicBot:
             self.bot_username = ""
             logger.warning(f"Could not fetch getMe info: {me}")
 
+
+    def get_deep_link_add_bot(self) -> str:
+        """Returns deep-link to add bot as admin with post_messages permission in 1 click."""
+        bot_uname = self.bot_username or "musxan_bot"
+        return f"https://t.me/{bot_uname}?startchannel=botadmin&admin=post_messages+edit_messages"
+
     def _api_call(self, method: str, json_data: dict = None, files: dict = None, data: dict = None, timeout: int = 30) -> dict:
         url = f"https://api.telegram.org/bot{self.settings.bot_token}/{method}"
         try:
@@ -141,23 +147,172 @@ class MusicBot:
 
     def get_user_target_channel(self, user_id: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """
-        Resolves target channel and title for a user or chat.
-        Returns (target_channel, channel_title).
-        Priority:
-        1. User-specific setting in DB (from user_id)
-        2. Chat-specific setting in DB (if in group)
-        3. Default channel from settings.default_channel_id
+        Resolves the active target channel for the requesting user.
+        Strictly per-user: NO default channel fallback, no channel leakage.
         """
-        setting = None
-        if user_id:
-            setting = self.db.get_user_channel(str(user_id))
-        if not setting and chat_id:
-            setting = self.db.get_user_channel(str(chat_id))
-        if setting and setting.get("target_channel"):
-            return setting["target_channel"], setting.get("target_channel_title") or "Канал"
-        if self.settings.default_channel_id:
-            return self.settings.default_channel_id, "Канал"
+        uid = str(user_id or chat_id or "")
+        if not uid:
+            return None, None
+        active = self.db.get_active_channel(uid)
+        if active and active.get("target_channel"):
+            return str(active["target_channel"]), active.get("target_channel_title") or "Канал"
         return None, None
+
+    def show_channels_menu(self, chat_id: str, user_id: str, edit_msg_id: Optional[int] = None):
+        """Displays interactive list of channels where the user has added the bot as administrator."""
+        channels = self.db.get_user_channels(user_id)
+        active = self.db.get_active_channel(user_id)
+        active_id = str(active["target_channel"]) if active else None
+
+        buttons = []
+        for ch in channels:
+            cid = str(ch["channel_id"])
+            ctitle = ch["channel_title"]
+            is_active = (cid == active_id)
+            prefix = "✅ " if is_active else "▫️ "
+            buttons.append([
+                {"text": f"{prefix}{ctitle}", "callback_data": f"ch_select:{cid}"},
+                {"text": "🗑️ Отвязать", "callback_data": f"ch_del:{cid}"}
+            ])
+
+        buttons.append([
+            {"text": "➕ Добавить бота в канал", "url": self.get_deep_link_add_bot()}
+        ])
+
+        if channels:
+            cur_name = active.get("target_channel_title", "Не выбран") if active else "Не выбран"
+            text = (
+                "📢 <b>Управление вашими каналами</b>\n\n"
+                f"🎯 <b>Активный канал:</b> <b>{cur_name}</b>\n\n"
+                "• Нажмите на канал в списке, чтобы сделать его активным для публикации музыки.\n"
+                "• Нажмите <b>«➕ Добавить бота в канал»</b>, чтобы подключить новый канал — он появится в этом списке автоматически!"
+            )
+        else:
+            text = (
+                "📢 <b>У вас пока нет подключенных каналов</b>\n\n"
+                "Чтобы публиковать музыку в ваш канал или группу:\n\n"
+                "1. Нажмите кнопку <b>«➕ Добавить бота в канал»</b> ниже.\n"
+                "2. Выберите ваш канал — Telegram сразу предложит добавить бота администратором.\n"
+                "3. После добавления канал <b>автоматически подтянется</b> сюда без необходимости искать его ID или ссылку!\n\n"
+                "<i>(Также можно отправить ID или @username вручную: <code>/setchannel @username</code>)</i>"
+            )
+
+        reply_markup = {"inline_keyboard": buttons}
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=reply_markup)
+        else:
+            self.send_message(chat_id, text, reply_markup=reply_markup)
+
+    def handle_my_chat_member(self, mcm: dict):
+        """
+        Catches real-time Telegram updates when the bot is added to a channel/group,
+        promoted to administrator, or removed.
+        """
+        try:
+            chat = mcm.get("chat", {})
+            from_user = mcm.get("from", {})
+            new_member = mcm.get("new_chat_member", {})
+
+            chat_id = str(chat.get("id", ""))
+            chat_title = chat.get("title") or chat.get("username") or "Канал"
+            chat_username = chat.get("username")
+            user_id = str(from_user.get("id", ""))
+            new_status = new_member.get("status", "")
+
+            logger.info(f"my_chat_member update: user={user_id}, chat={chat_id} ({chat_title}), status={new_status}")
+
+            if not user_id or not chat_id:
+                return
+
+            if new_status in ("administrator", "creator"):
+                can_post = new_member.get("can_post_messages", True)
+                self.db.save_user_channel(
+                    user_id=user_id,
+                    channel_id=chat_id,
+                    channel_title=chat_title,
+                    channel_username=chat_username,
+                    status="administrator"
+                )
+                self.db.set_active_channel(user_id, chat_id, chat_title)
+
+                msg_text = (
+                    f"🎉 <b>Канал успешно подключен!</b>\n\n"
+                    f"📢 <b>{chat_title}</b> (<code>{chat_id}</code>)\n"
+                    f"• Статус: <b>Администратор</b>\n\n"
+                    f"✅ Канал установлен как <b>активный</b> для отправки музыки.\n"
+                    f"Теперь при нажатии «Закинуть в канал» треки будут отправляться именно сюда!"
+                )
+                if not can_post:
+                    msg_text += "\n\n⚠️ <i>Внимание: отключено право на публикацию сообщений. Включите его в настройках администратора канала, чтобы бот мог отправлять аудио.</i>"
+
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "📋 Мои каналы", "callback_data": "channels:list"}]
+                    ]
+                }
+                self.send_message(user_id, msg_text, reply_markup=reply_markup)
+
+            elif new_status in ("left", "kicked"):
+                self.db.remove_user_channel(user_id, chat_id)
+                self.send_message(
+                    user_id,
+                    f"ℹ️ Бот был удален из канала «<b>{chat_title}</b>». Привязка канала удалена."
+                )
+
+            elif new_status == "member":
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "👑 Назначить администратором", "url": self.get_deep_link_add_bot()}]
+                    ]
+                }
+                self.send_message(
+                    user_id,
+                    f"⚠️ <b>Бот добавлен в «{chat_title}», но без прав администратора!</b>\n\n"
+                    "Чтобы бот мог публиковать музыку, назначьте его <b>Администратором</b> с правом «Публикация сообщений».\n\n"
+                    "Нажмите кнопку ниже, чтобы обновить права бота:",
+                    reply_markup=reply_markup
+                )
+        except Exception as e:
+            logger.error(f"Error handling my_chat_member: {e}")
+
+    def _handle_shared_chat(self, chat_id: str, user_id: str, shared_id: str):
+        """Handles Telegram Bot API chat_shared event from KeyboardButtonRequestChat."""
+        chat_info = self._api_call("getChat", json_data={"chat_id": shared_id})
+        if not chat_info.get("ok"):
+            self.send_message(chat_id, f"❌ Не удалось получить информацию о канале <code>{shared_id}</code>.")
+            return
+
+        res = chat_info.get("result", {})
+        title = res.get("title") or res.get("username") or str(shared_id)
+        username = res.get("username")
+
+        # Check admin rights
+        if self.bot_id:
+            member_info = self._api_call("getChatMember", json_data={"chat_id": shared_id, "user_id": self.bot_id})
+            if member_info.get("ok"):
+                status = member_info.get("result", {}).get("status", "")
+                if status not in ("administrator", "creator"):
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [{"text": "👑 Назначить администратором", "url": self.get_deep_link_add_bot()}]
+                        ]
+                    }
+                    self.send_message(
+                        chat_id,
+                        f"⚠️ В канале «<b>{title}</b>» бот не является администратором.\n"
+                        "Назначьте бота администратором с правом публикации сообщений.",
+                        reply_markup=reply_markup
+                    )
+                    return
+
+        self.db.save_user_channel(user_id, shared_id, title, username, "administrator")
+        self.db.set_active_channel(user_id, shared_id, title)
+        self.send_message(
+            chat_id,
+            f"✅ <b>Канал подключен и выбран активным:</b>\n\n"
+            f"📢 <b>{title}</b> (<code>{shared_id}</code>)\n"
+            "Теперь найденная музыка будет публиковаться сюда!"
+        )
 
     def process_search_and_preview(
         self,
@@ -357,6 +512,31 @@ class MusicBot:
             return
 
         action, param = cb_data.split(":", 1)
+
+        # Channel management callbacks
+        if action == "ch_select":
+            ch = self.db.get_channel_by_id(from_user_id, param)
+            if ch:
+                self.db.set_active_channel(from_user_id, param, ch["channel_title"])
+                self._api_call("answerCallbackQuery", json_data={
+                    "callback_query_id": cb_id,
+                    "text": f"✅ Выбран: {ch['channel_title']}"
+                })
+                self.show_channels_menu(chat_id, from_user_id, edit_msg_id=msg_id)
+            else:
+                self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id, "text": "Канал не найден"})
+            return
+
+        if action == "ch_del":
+            self.db.remove_user_channel(from_user_id, param)
+            self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id, "text": "🗑️ Канал отвязан"})
+            self.show_channels_menu(chat_id, from_user_id, edit_msg_id=msg_id)
+            return
+
+        if action == "channels" and param == "list":
+            self._api_call("answerCallbackQuery", json_data={"callback_query_id": cb_id})
+            self.show_channels_menu(chat_id, from_user_id, edit_msg_id=msg_id)
+            return
 
         # 1. Dismiss notification
         if action == "dismiss":
@@ -581,12 +761,20 @@ class MusicBot:
 
             target_channel, ch_title = self.get_user_target_channel(user_id, chat_id)
             if not target_channel:
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "➕ Добавить бота в канал", "url": self.get_deep_link_add_bot()}],
+                        [{"text": "📋 Мои каналы", "callback_data": "channels:list"}]
+                    ]
+                }
                 self.send_message(
                     chat_id,
-                    "⚠️ <b>Канал для публикации не настроен!</b>\n\n"
-                    "Пожалуйста, привяжите ваш канал или группу командой:\n"
-                    "<code>/setchannel @имя_канала</code> или <code>/setchannel -100xxxxxxxxxx</code>\n\n"
-                    "<i>(Не забудьте добавить бота администратором в ваш канал с правом отправки сообщений).</i>"
+                    "⚠️ <b>Канал для публикации не выбран!</b>\n\n"
+                    "Чтобы треки отправлялись в ваш канал или группу:\n"
+                    "1. Нажмите <b>«➕ Добавить бота в канал»</b> ниже.\n"
+                    "2. Выберите ваш канал — Telegram добавит бота администратором.\n"
+                    "3. После добавления канал подключится автоматически!",
+                    reply_markup=reply_markup
                 )
                 return
 
@@ -673,12 +861,20 @@ class MusicBot:
 
             target_channel, ch_title = self.get_user_target_channel(user_id, chat_id)
             if not target_channel:
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "➕ Добавить бота в канал", "url": self.get_deep_link_add_bot()}],
+                        [{"text": "📋 Мои каналы", "callback_data": "channels:list"}]
+                    ]
+                }
                 self.send_message(
                     chat_id,
-                    "⚠️ <b>Канал для публикации не настроен!</b>\n\n"
-                    "Пожалуйста, привяжите ваш канал или группу командой:\n"
-                    "<code>/setchannel @имя_канала</code> или <code>/setchannel -100xxxxxxxxxx</code>\n\n"
-                    "<i>(Не забудьте добавить бота администратором в ваш канал с правом отправки сообщений).</i>"
+                    "⚠️ <b>Канал для публикации не выбран!</b>\n\n"
+                    "Чтобы треки отправлялись в ваш канал или группу:\n"
+                    "1. Нажмите <b>«➕ Добавить бота в канал»</b> ниже.\n"
+                    "2. Выберите ваш канал — Telegram добавит бота администратором.\n"
+                    "3. После добавления канал подключится автоматически!",
+                    reply_markup=reply_markup
                 )
                 return
 
@@ -773,6 +969,14 @@ class MusicBot:
             self.settings.chat_id = chat_id
             logger.info(f"Auto-bound default chat ID: {chat_id}")
 
+        # Check Telegram Bot API 6.7+ / 7.0+ request_chat response (chat_shared)
+        chat_shared = msg.get("chat_shared") or (msg.get("chats_shared", {}).get("chats", [{}])[0] if msg.get("chats_shared") else None)
+        if chat_shared:
+            shared_id = str(chat_shared.get("chat_id", ""))
+            if shared_id:
+                self._handle_shared_chat(chat_id, sender_id, shared_id)
+                return
+
         # Check conversational states (tag editing) asynchronously
         if chat_id in self.user_states:
             state = self.user_states.pop(chat_id)
@@ -793,109 +997,113 @@ class MusicBot:
                 "• <code>/music &lt;название&gt;</code> — Скачать MP3 (320 kbps, обложка 1:1, EBU R128)\n"
                 "• <code>/album &lt;ссылка&gt;</code> — Пакетное скачивание альбома / плейлиста\n"
                 "• <code>/lyrics &lt;трек&gt;</code> — Поиск и показ слов песни\n\n"
-                "📢 <b>Настройка вашего канала / группы:</b>\n"
-                "• <code>/setchannel &lt;@канал или ID&gt;</code> — Привязать целевой канал/группу\n"
-                "• <code>/mychannel</code> — Посмотреть текущий канал для публикации\n"
-                "• <code>/clearchannel</code> — Отвязать канал\n\n"
+                "📢 <b>Настройка каналов:</b>\n"
+                "• <code>/channels</code> — Управление подключенными каналами и добавление в 1 клик\n"
+                "• <code>/mychannel</code> — Посмотреть текущий активный канал\n"
+                "• <code>/clearchannel</code> — Сбросить выбор активного канала\n\n"
                 "📊 <b>Статус:</b>\n"
                 "• <code>/status</code> — Статистика воркеров, кэша и диска"
             )
             self.send_message(chat_id, help_text)
             return
 
+        if cmd in ("/channels", "/channel"):
+            self.show_channels_menu(chat_id, sender_id)
+            return
+
         if cmd in ("/setchannel", "/setgroup"):
             target = args[0].strip() if args else ""
             if not target:
-                self.send_message(
-                    chat_id,
-                    "⚠️ <b>Как привязать канал или группу для музыки:</b>\n\n"
-                    "1. Добавьте бота в ваш канал или группу как <b>Администратора</b> (с правом публикации сообщений).\n"
-                    "2. Отправьте команду:\n"
-                    "<code>/setchannel @username_канала</code>\n"
-                    "или укажите числовой ID:\n"
-                    "<code>/setchannel -100xxxxxxxxxx</code>\n\n"
-                    "<i>Чтобы узнать текущую привязку: /mychannel\n"
-                    "Чтобы отвязать: /clearchannel</i>"
-                )
+                self.show_channels_menu(chat_id, sender_id)
                 return
 
             chat_info = self._api_call("getChat", json_data={"chat_id": target})
             if not chat_info.get("ok"):
                 desc = chat_info.get("description", "Чат не найден")
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "➕ Добавить бота в канал", "url": self.get_deep_link_add_bot()}]
+                    ]
+                }
                 self.send_message(
                     chat_id,
                     f"❌ <b>Не удалось найти канал/группу <code>{target}</code></b>\n\n"
                     f"Telegram ответил: <i>{desc}</i>\n\n"
                     "💡 <b>Решение:</b>\n"
-                    f"1. Добавьте бота (@{self.bot_username or 'бота'}) в этот канал или группу.\n"
-                    "2. Назначьте его <b>Администратором</b> (право «Публикация сообщений» / «Post messages»).\n"
-                    f"3. Повторите команду: <code>/setchannel {target}</code>"
+                    "Нажмите кнопку ниже, чтобы добавить бота администратором в ваш канал (он подключится автоматически):",
+                    reply_markup=reply_markup
                 )
                 return
 
             res_obj = chat_info.get("result", {})
             title = res_obj.get("title") or res_obj.get("username") or str(target)
             target_id = str(res_obj.get("id", target))
+            username = res_obj.get("username")
 
             if self.bot_id:
                 member_info = self._api_call("getChatMember", json_data={"chat_id": target_id, "user_id": self.bot_id})
                 if member_info.get("ok"):
                     status = member_info.get("result", {}).get("status", "")
                     if status not in ("administrator", "creator"):
+                        reply_markup = {
+                            "inline_keyboard": [
+                                [{"text": "👑 Назначить администратором", "url": self.get_deep_link_add_bot()}]
+                            ]
+                        }
                         self.send_message(
                             chat_id,
                             f"⚠️ <b>Внимание:</b> Бот состоит в «{title}», но статус <code>{status}</code> (не администратор).\n"
-                            "Убедитесь, что боту разрешено публиковать сообщения."
+                            "Убедитесь, что боту разрешено публиковать сообщения.",
+                            reply_markup=reply_markup
                         )
 
-            self.db.set_user_channel(sender_id, target_id, title)
-            if chat_id != sender_id:
-                self.db.set_user_channel(chat_id, target_id, title)
+            self.db.save_user_channel(sender_id, target_id, title, username, "administrator")
+            self.db.set_active_channel(sender_id, target_id, title)
 
             self.send_message(
                 chat_id,
-                f"✅ <b>Канал успешно привязан!</b>\n\n"
+                f"✅ <b>Канал успешно привязан и выбран активным!</b>\n\n"
                 f"📢 <b>{title}</b> (<code>{target_id}</code>)\n\n"
                 "Теперь при нажатии «Закинуть в канал» треки будут отправляться в ваш канал!"
             )
             return
 
         if cmd == "/mychannel":
-            target_ch, ch_title = self.get_user_target_channel(sender_id, chat_id)
-            if target_ch:
+            active = self.db.get_active_channel(sender_id)
+            if active:
+                target_ch = active["target_channel"]
+                ch_title = active.get("target_channel_title", "Канал")
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "📋 Управление каналами", "callback_data": "channels:list"}],
+                        [{"text": "➕ Добавить еще канал", "url": self.get_deep_link_add_bot()}]
+                    ]
+                }
                 self.send_message(
                     chat_id,
-                    f"📢 <b>Ваш текущий канал для публикации:</b>\n\n"
+                    f"📢 <b>Ваш текущий активный канал:</b>\n\n"
                     f"• Название: <b>{ch_title}</b>\n"
-                    f"• ID / Username: <code>{target_ch}</code>\n\n"
-                    "<i>Чтобы изменить: <code>/setchannel @username</code>\n"
-                    "Чтобы сбросить привязку: <code>/clearchannel</code></i>"
+                    f"• ID: <code>{target_ch}</code>\n\n"
+                    "Все отправляемые треки публикуются именно сюда.",
+                    reply_markup=reply_markup
                 )
             else:
-                self.send_message(
-                    chat_id,
-                    "📢 <b>Канал для публикации пока не привязан.</b>\n\n"
-                    "Чтобы треки публиковались в ваш канал или группу:\n"
-                    "1. Добавьте бота администратором в ваш канал/группу.\n"
-                    "2. Отправьте: <code>/setchannel @username</code> или <code>/setchannel -100xxxxxxxxxx</code>"
-                )
+                self.show_channels_menu(chat_id, sender_id)
             return
 
         if cmd == "/clearchannel":
-            cleared = self.db.clear_user_channel(sender_id)
-            if chat_id != sender_id:
-                self.db.clear_user_channel(chat_id)
+            cleared = self.db.clear_active_channel(sender_id)
             if cleared:
                 self.send_message(
                     chat_id,
-                    "🗑️ <b>Привязка канала удалена.</b>\n\n"
-                    "Вы можете настроить новый канал в любое время командой <code>/setchannel @username</code>."
+                    "🗑️ <b>Выбор активного канала сброшен.</b>\n\n"
+                    "Вы можете выбрать другой канал командой <code>/channels</code>."
                 )
             else:
                 self.send_message(
                     chat_id,
-                    "ℹ️ У вас не было настроено персонального канала.\n"
-                    "Привязать канал можно командой: <code>/setchannel @username</code>"
+                    "ℹ️ У вас не было выбрано активного канала.\n"
+                    "Открыть список каналов: <code>/channels</code>"
                 )
             return
 
@@ -905,8 +1113,9 @@ class MusicBot:
             with self._lock:
                 active_count = len(self.active_track_actions)
             cache_count = self.db.count_cached_tracks()
-            target_ch, ch_title = self.get_user_target_channel(sender_id, chat_id)
-            ch_display = f"{ch_title} (<code>{target_ch}</code>)" if target_ch else "<i>Не настроен (/setchannel)</i>"
+            user_channels = self.db.get_user_channels(sender_id)
+            active = self.db.get_active_channel(sender_id)
+            ch_display = f"<b>{active['target_channel_title']}</b> (<code>{active['target_channel']}</code>)" if active else "<i>Не выбран (/channels)</i>"
             temp_hours = self.settings.temp_expiration_sec // 3600
 
             status_text = (
@@ -916,7 +1125,8 @@ class MusicBot:
                 f"📁 Временных файлов на диске: <code>{disk_items}</code>\n"
                 f"⏳ Срок хранения кэша на диске: <code>{temp_hours} ч.</code>\n"
                 f"🗄️ Хранение истории в БД: <code>{self.settings.cache_expiration_days or 'бессрочно'} дн.</code>\n"
-                f"📢 Целевой канал: {ch_display}\n"
+                f"📢 Ваш активный канал: {ch_display}\n"
+                f"📋 Подключенных каналов у вас: <code>{len(user_channels)}</code>\n"
                 f"🌐 Webhook порт: <code>{self.settings.port}</code>"
             )
             self.send_message(chat_id, status_text)
@@ -1084,8 +1294,9 @@ class MusicBot:
                     self.cleanup_expired_pending()
                     last_cleanup = time.time()
 
+                allowed_updates = json.dumps(["message", "callback_query", "my_chat_member", "chat_member"])
                 r = self.session.get(
-                    f"https://api.telegram.org/bot{self.settings.bot_token}/getUpdates?offset={offset}&timeout=20",
+                    f"https://api.telegram.org/bot{self.settings.bot_token}/getUpdates?offset={offset}&timeout=20&allowed_updates={allowed_updates}",
                     timeout=30
                 )
 
@@ -1110,6 +1321,11 @@ class MusicBot:
                     cb = update.get("callback_query")
                     if cb:
                         self.handle_callback_query(cb)
+                        continue
+
+                    mcm = update.get("my_chat_member")
+                    if mcm:
+                        self.handle_my_chat_member(mcm)
                         continue
 
                     msg = update.get("message")

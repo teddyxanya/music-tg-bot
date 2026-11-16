@@ -11,7 +11,7 @@ import contextlib
 import unicodedata
 import re
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("music_bot.database")
 
@@ -47,6 +47,7 @@ class Database:
             cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute("PRAGMA synchronous=NORMAL;")
 
+            # Track cache table for instant 0.1s audio replay
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS track_cache (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +65,22 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_query ON track_cache(query_clean);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_cache_artist_title ON track_cache(artist, title);")
 
+            # Channels where bot is administrator, mapped to the user who added/manages it
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    channel_title TEXT NOT NULL,
+                    channel_username TEXT,
+                    status TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(user_id, channel_id)
+                );
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_channels_uid ON user_channels(user_id);")
+
+            # Active target channel for each user
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id TEXT PRIMARY KEY,
@@ -75,38 +92,29 @@ class Database:
             conn.commit()
             logger.info(f"Database initialized in WAL mode at {self.db_path}")
 
+    # Track cache methods
     def get_cached_track(
         self,
         query: str,
         hint_artist: Optional[str] = None,
         hint_title: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """Looks up a track in the cache by normalized query or artist + title."""
         norm_q = normalize_key(query)
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Direct query match
             if norm_q:
-                cursor.execute(
-                    "SELECT * FROM track_cache WHERE query_clean = ? LIMIT 1",
-                    (norm_q,)
-                )
+                cursor.execute("SELECT * FROM track_cache WHERE query_clean = ? LIMIT 1", (norm_q,))
                 row = cursor.fetchone()
                 if row:
                     return dict(row)
 
-            # 2. Artist + Title match
             if hint_artist and hint_title:
                 norm_combo = normalize_key(f"{hint_artist} {hint_title}")
-                cursor.execute(
-                    "SELECT * FROM track_cache WHERE query_clean = ? LIMIT 1",
-                    (norm_combo,)
-                )
+                cursor.execute("SELECT * FROM track_cache WHERE query_clean = ? LIMIT 1", (norm_combo,))
                 row = cursor.fetchone()
                 if row:
                     return dict(row)
 
-            # 3. Fuzzy search in title/artist
             if norm_q:
                 cursor.execute(
                     "SELECT * FROM track_cache WHERE LOWER(artist || ' ' || title) = ? OR LOWER(title || ' ' || artist) = ? LIMIT 1",
@@ -119,7 +127,6 @@ class Database:
         return None
 
     def get_track_by_id(self, track_id: int) -> Optional[Dict[str, Any]]:
-        """Fetches a cached track record by its primary key ID."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM track_cache WHERE id = ? LIMIT 1", (track_id,))
@@ -127,7 +134,6 @@ class Database:
             return dict(row) if row else None
 
     def count_cached_tracks(self) -> int:
-        """Returns total number of cached tracks."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM track_cache")
@@ -144,7 +150,6 @@ class Database:
         channel_link: Optional[str] = None,
         genre: Optional[str] = None
     ):
-        """Caches a newly sent/uploaded track."""
         norm_q = normalize_key(query)
         combo_q = normalize_key(f"{artist} {title}")
         now = time.time()
@@ -178,7 +183,6 @@ class Database:
             conn.commit()
 
     def update_channel_info(self, cached_id: int, channel_msg_id: int, channel_link: str):
-        """Updates channel publication link and message ID for a cached track."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -188,7 +192,6 @@ class Database:
             conn.commit()
 
     def update_cached_tags(self, file_id: str, new_artist: str, new_title: str):
-        """Updates artist and title metadata for an existing cached track."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -197,18 +200,99 @@ class Database:
             )
             conn.commit()
 
-    def get_user_channel(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Returns the user's custom publishing channel settings, if configured."""
+    # User channels & settings methods
+    def save_user_channel(
+        self,
+        user_id: str,
+        channel_id: str,
+        channel_title: str,
+        channel_username: Optional[str] = None,
+        status: str = "administrator"
+    ):
+        """Saves or updates a channel where the user added the bot as administrator."""
+        now = time.time()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO user_channels (user_id, channel_id, channel_title, channel_username, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, channel_id) DO UPDATE SET
+                    channel_title = excluded.channel_title,
+                    channel_username = COALESCE(excluded.channel_username, user_channels.channel_username),
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+            """, (str(user_id), str(channel_id), channel_title.strip(), channel_username, status, now))
+            conn.commit()
+
+    def get_user_channels(self, user_id: str) -> List[Dict[str, Any]]:
+        """Returns all channels where this user has added the bot as administrator."""
+        if not user_id:
+            return []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM user_channels WHERE user_id = ? AND status IN ('administrator', 'creator') ORDER BY updated_at DESC",
+                (str(user_id),)
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_channel_by_id(self, user_id: str, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Gets a single channel info for a user."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM user_channels WHERE user_id = ? AND channel_id = ? LIMIT 1",
+                (str(user_id), str(channel_id))
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def remove_user_channel(self, user_id: str, channel_id: str) -> bool:
+        """Removes a channel from user's managed channels and clears active setting if matched."""
+        if not user_id or not channel_id:
+            return False
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM user_channels WHERE user_id = ? AND channel_id = ?",
+                (str(user_id), str(channel_id))
+            )
+            cursor.execute(
+                "DELETE FROM user_settings WHERE user_id = ? AND target_channel = ?",
+                (str(user_id), str(channel_id))
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_active_channel(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the user's currently selected active target channel."""
         if not user_id:
             return None
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM user_settings WHERE user_id = ? LIMIT 1", (str(user_id),))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                return dict(row)
 
-    def set_user_channel(self, user_id: str, target_channel: str, title: Optional[str] = None):
-        """Sets or updates the target channel for a user."""
+            # Auto-fallback to the only connected channel if user has exactly one
+            cursor.execute(
+                "SELECT * FROM user_channels WHERE user_id = ? AND status IN ('administrator', 'creator') LIMIT 2",
+                (str(user_id),)
+            )
+            chs = cursor.fetchall()
+            if len(chs) == 1:
+                single = dict(chs[0])
+                self.set_active_channel(user_id, single["channel_id"], single["channel_title"])
+                return {
+                    "target_channel": single["channel_id"],
+                    "target_channel_title": single["channel_title"]
+                }
+
+            return None
+
+    def set_active_channel(self, user_id: str, target_channel: str, title: Optional[str] = None):
+        """Sets or updates the active target channel for a user."""
         now = time.time()
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -222,8 +306,8 @@ class Database:
             """, (str(user_id), str(target_channel).strip(), title.strip() if title else None, now))
             conn.commit()
 
-    def clear_user_channel(self, user_id: str) -> bool:
-        """Removes the custom channel setting for a user."""
+    def clear_active_channel(self, user_id: str) -> bool:
+        """Clears the active channel setting for a user."""
         if not user_id:
             return False
         with self._get_connection() as conn:
